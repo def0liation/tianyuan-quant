@@ -1,0 +1,4 @@
+# Normalize all text files to LF in the repository.
+# The repo is fully LF today; this prevents editor/tool CRLF conversions from
+# showing up as whole-file diffs (33 files were polluted this way on 2026-07-02).
+* text=auto

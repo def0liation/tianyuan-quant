@@ -1,0 +1,39 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      APP_ENV: production
+      API_AUTH_MODE: strict
+      API_WRITE_TOKEN: ${API_WRITE_TOKEN:?Set API_WRITE_TOKEN in .env before starting production}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL_ALLOWLIST: ${LLM_BASE_URL_ALLOWLIST:-}
+      TUSHARE_TOKEN: ${TUSHARE_TOKEN:-}
+      MARKET_DATA_API_KEY: ${MARKET_DATA_API_KEY:-}
+      MARKET_DATA_BASE_URL_ALLOWLIST: ${MARKET_DATA_BASE_URL_ALLOWLIST:-}
+      TIANYUAN_QUANT_DB_URL: sqlite+aiosqlite:////app/storage/tianyuan_quant.db
+      SEED_MOCK_HISTORY: "0"
+    volumes:
+      - ./deploy/db:/app/storage
+      - ./deploy/backend-storage:/app/backend/app/storage
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).read()"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports:
+      - "5174:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped

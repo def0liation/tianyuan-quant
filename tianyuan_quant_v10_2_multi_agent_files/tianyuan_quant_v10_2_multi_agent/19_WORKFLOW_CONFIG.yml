@@ -1,0 +1,135 @@
+# 天元量化 Agent v10.2 Workflow Config
+# 可作为 LangGraph / Dify / 自研工作流的参考配置；当前项目不再提供 Coze SignalOps 接口
+
+workflow_name: tianyuan_quant_agent_v10_2_multi_agent
+version: 10.2
+mode: api_orchestrated
+
+shared_rules:
+  compliance_first: true
+  no_auto_order: true
+  no_profit_promise: true
+  require_human_confirmation: true
+  evidence_tags: [C, I, U]
+  no_level2_no_orderbook_claim: true
+  no_tools_no_exact_calculation: true
+
+nodes:
+  - id: router
+    file: 03_ROUTER_Agent.md
+    type: llm_json
+    next: orchestrator
+
+  - id: orchestrator
+    file: 02_ORCHESTRATOR_主控编排Agent.md
+    type: policy_engine
+    next_if_continue: data_fetch
+    next_if_stop: final_writer
+
+  - id: data_fetch
+    file: 04_DATA_FETCH_Agent.md
+    type: tool_layer
+    next: guardrail_hub
+
+  - id: guardrail_hub
+    file: GUARDRAIL_HUB.md
+    type: rule_engine
+    canonical_for: [dvg, dvg_gate, risk, risk_firewall, atrade, trade_micro]
+    mirrors_legacy_fields: [dvg, risk, atrade, killSwitch]
+    next_if_pass: market
+    next_if_warn: market
+    next_if_review_only: market
+    next_if_hard_block: final_writer
+
+  - id: market
+    file: 08_MARKET_Regime_Agent.md
+    type: llm_json
+    next: factor_slicing
+
+  - id: factor_slicing
+    file: 09_FACTOR_SLICING_Agent.md
+    type: llm_json_or_tool
+    default_mode: lite
+    next: qiam
+
+  - id: qiam
+    file: 10_QIAM_Agent.md
+    type: llm_json_or_tool
+    next_if_pass: scenario
+    next_if_block: final_writer
+
+  - id: scenario
+    file: 11_SCENARIO_ENGINE_Agent.md
+    type: tool_or_qualitative
+    next: portfolio
+
+  - id: portfolio
+    file: 12_PORTFOLIO_Agent.md
+    type: llm_json_or_rule_engine
+    next: execution
+
+  - id: execution
+    file: 13_EXECUTION_Agent.md
+    type: llm_json_or_rule_engine
+    next: anti_conclusion
+
+  - id: anti_conclusion
+    file: 14_ANTI_CONCLUSION_Agent.md
+    type: llm_json
+    next_if_pass: signalops
+    next_if_rewrite: final_writer
+    next_if_block: final_writer
+
+  - id: signalops
+    file: 15_SIGNALOPS_Agent.md
+    type: optional_ledger
+    run_condition: final_action in [LIGHT_WATCH, BUY_CANDIDATE, ADD_CANDIDATE, SIGNAL_ONLY, PAPER_TEST_ONLY]
+    next: final_writer
+
+  - id: meta_review
+    file: 16_META_REVIEW_Agent.md
+    type: optional_governance
+    run_condition: task_type in [RULE_UPDATE, META_REVIEW] or repeated_error_count >= 2
+    next: final_writer
+
+  - id: final_writer
+    file: 17_FINAL_WRITER_Agent.md
+    type: llm_text
+    terminal: true
+
+kill_switch:
+  compliance_violation:
+    final_writer_mode: COMPLIANCE_REFUSAL
+    blocked_paths: [ALL_TRADE_RELATED]
+
+  risk_hard_reject:
+    final_writer_mode: HARD_RISK_FINAL_ONLY
+    blocked_paths: [BUY, ADD, CHASE, HEAVY_POSITION, EXECUTION_BUY]
+
+  dvg_block_buy:
+    final_writer_mode: HARD_RISK_FINAL_ONLY
+    blocked_paths: [BUY, ADD, QIAM_POSITIVE, SCENARIO_BUY, EXECUTION_BUY]
+
+  atrade_not_reachable:
+    final_writer_mode: HARD_RISK_FINAL_ONLY
+    blocked_paths: [EXECUTION_PLAN, MARKET_ORDER, CHASE_BUY]
+
+  qiam_block_buy:
+    final_writer_mode: HARD_RISK_FINAL_ONLY
+    blocked_paths: [BUY, ADD, EXECUTION_BUY]
+
+run_modes:
+  FAST_MODE:
+    max_total_tool_calls: 5
+    high_cost_tools_allowed: false
+    enabled_nodes: [router, orchestrator, data_fetch, guardrail_hub, market, factor_slicing, final_writer]
+
+  STANDARD_MODE:
+    max_total_tool_calls: 12
+    high_cost_tools_allowed: false
+    enabled_nodes: [router, orchestrator, data_fetch, guardrail_hub, market, factor_slicing, qiam, scenario, portfolio, execution, anti_conclusion, signalops, final_writer]
+
+  DEEP_MODE:
+    max_total_tool_calls: 25
+    high_cost_tools_allowed: true
+    enabled_nodes: [router, orchestrator, data_fetch, guardrail_hub, market, factor_slicing, qiam, scenario, portfolio, execution, anti_conclusion, signalops, meta_review, final_writer]

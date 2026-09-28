@@ -1,0 +1,32 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - TUSHARE_TOKEN=${TUSHARE_TOKEN:-}
+      - MARKET_DATA_API_KEY=${MARKET_DATA_API_KEY:-}
+      - TIANYUAN_QUANT_DB_URL=sqlite+aiosqlite:////app/storage/tianyuan_quant.db
+      - SEED_MOCK_HISTORY=0
+    volumes:
+      - ./storage:/app/storage
+      - ./backend/app/storage:/app/backend/app/storage
+    restart: unless-stopped
+
+  frontend:
+    image: node:20-alpine
+    working_dir: /app/frontend
+    ports:
+      - "5174:5174"
+    environment:
+      - VITE_API_PROXY_TARGET=http://backend:8000
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    volumes:
+      - ./frontend:/app/frontend
+      - /app/frontend/node_modules
+    depends_on:
+      - backend
+    restart: unless-stopped

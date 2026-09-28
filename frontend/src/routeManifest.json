@@ -1,0 +1,73 @@
+{
+  "navGroups": [
+    {
+      "title": "工作台",
+      "items": [
+        { "label": "股市全局", "path": "/global-market", "icon": "BarChart3" },
+        { "label": "分析总览", "path": "/", "icon": "LayoutDashboard" },
+        { "label": "新建任务", "path": "/new-task", "icon": "ClipboardCheck" },
+        { "label": "真实持仓", "path": "/portfolio", "icon": "Database" },
+        { "label": "研究实验室", "path": "/research-lab", "icon": "Beaker" },
+        { "label": "运行对比", "path": "/run-compare", "icon": "GitBranch" },
+        { "label": "实时运行", "path": "/live-run", "icon": "Activity" },
+        { "label": "Agent 流程图", "path": "/dag", "icon": "GitBranch" },
+        { "label": "Agent 辩论与 Token", "path": "/debate", "icon": "BrainCircuit" }
+      ]
+    },
+    {
+      "title": "护栏链",
+      "items": [
+        { "label": "权限矩阵", "path": "/permission", "icon": "ShieldAlert" },
+        { "label": "数据可靠性引擎", "path": "/data-reliability", "icon": "Layers" },
+        { "label": "统一护栏", "path": "/guardrail-hub", "icon": "ShieldCheck" },
+        { "label": "量化核心", "path": "/quant-core", "icon": "Cpu" },
+        { "label": "执行复核", "path": "/execution", "icon": "ListChecks" },
+        { "label": "反结论", "path": "/anti-conclusion", "icon": "Router" }
+      ]
+    },
+    {
+      "title": "审计与配置",
+      "items": [
+        { "label": "SignalOps", "path": "/signalops", "icon": "Router" },
+        { "label": "审计日志", "path": "/audit", "icon": "Activity" },
+        { "label": "最终输出", "path": "/final", "icon": "ListChecks" },
+        { "label": "后端状态", "path": "/backend", "icon": "Gauge" },
+        { "label": "后端调参", "path": "/tuning", "icon": "SlidersHorizontal" },
+        { "label": "配置版本", "path": "/config-versions", "icon": "Database" },
+        { "label": "插件 Agent", "path": "/plugins", "icon": "Plug" },
+        { "label": "系统设置", "path": "/settings", "icon": "Settings" }
+      ]
+    }
+  ],
+  "redirects": [
+    { "from": "/research-loops", "to": "/research-lab/research" },
+    { "from": "/knowledge", "to": "/research-lab/knowledge" },
+    { "from": "/case-library", "to": "/research-lab/cases" },
+    { "from": "/evaluation", "to": "/research-lab/evaluation" },
+    { "from": "/knowledge-versions", "to": "/research-lab/versions" },
+    { "from": "/data-compression", "to": "/research-lab/evidence" },
+    { "from": "/backtest", "to": "/research-lab/backtest" },
+    { "from": "/market", "to": "/quant-core" },
+    { "from": "/technical-kline", "to": "/quant-core" },
+    { "from": "/bottom-research", "to": "/quant-core" },
+    { "from": "/quant-engine", "to": "/quant-core" },
+    { "from": "/scenario", "to": "/quant-core" }
+  ],
+  "legacyRoutes": [
+    "/dvg-gate",
+    "/risk",
+    "/trade-micro"
+  ],
+  "researchRoutes": [
+    "/research-lab",
+    "/research-lab/overview",
+    "/research-lab/research",
+    "/research-lab/evidence",
+    "/research-lab/backtest",
+    "/research-lab/knowledge",
+    "/research-lab/cases",
+    "/research-lab/evaluation",
+    "/research-lab/versions",
+    "/research-lab/traces"
+  ]
+}
