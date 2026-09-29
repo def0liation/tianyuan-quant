@@ -74,8 +74,11 @@ jobs:
       - name: Verify proxy and backend access logs omit query credentials
         run: |
           docker compose -f docker-compose.prod.yml exec -T frontend nginx -t
-          code=$(curl --silent --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:5174/api/analysis/runs/RUN_CI_MISSING/stream?api_key=$API_WRITE_TOKEN")
-          test "$code" = 404
+          mkdir -p .tmp
+          code=$(curl --silent --show-error --max-time 15 --output .tmp/ci-stream.body --dump-header .tmp/ci-stream.headers --write-out '%{http_code}' "http://127.0.0.1:5174/api/analysis/runs/RUN_CI_MISSING/stream?api_key=$API_WRITE_TOKEN")
+          test "$code" = 200
+          grep --ignore-case --quiet '^content-type: text/event-stream' .tmp/ci-stream.headers
+          grep --fixed-strings --quiet 'RUN_NOT_FOUND' .tmp/ci-stream.body
           ci_service_logs=$(docker compose -f docker-compose.prod.yml logs --no-color)
           if printf '%s' "$ci_service_logs" | grep --fixed-strings --quiet -- "$API_WRITE_TOKEN"; then
             printf '%s\n' 'Access log credential redaction failed'
