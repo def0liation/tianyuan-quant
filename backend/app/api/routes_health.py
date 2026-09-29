@@ -241,9 +241,13 @@ def _check_auto_paper() -> Dict[str, Any]:
     try:
         status = auto_paper_trading_store.get_status()
         loop_health = str(status.get("loop_health") or "UNKNOWN")
+        enabled = bool(status.get("enabled"))
+        healthy = loop_health in {"DISABLED", "HEALTHY", "STARTING", "RUNNING"} or (
+            not enabled and loop_health == "STOPPED"
+        )
         return {
-            "status": "ok" if loop_health in {"DISABLED", "HEALTHY", "STARTING"} else "warn",
-            "enabled": bool(status.get("enabled")),
+            "status": "ok" if healthy else "warn",
+            "enabled": enabled,
             "loopRunning": bool(status.get("loop_running")),
             "loopHealth": loop_health,
             "lastError": status.get("last_error") or status.get("loop_last_error") or "",

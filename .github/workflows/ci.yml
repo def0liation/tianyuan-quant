@@ -37,7 +37,9 @@ jobs:
           npm --prefix frontend ci
           npm --prefix frontend exec -- playwright install chromium
       - name: Backend regression suite
-        run: python -m pytest backend/tests -q --basetemp=.tmp/ci-pytest
+        run: |
+          New-Item -ItemType Directory -Path .tmp -Force | Out-Null
+          python -m pytest backend/tests -q --basetemp=.tmp/ci-pytest
       - name: Frontend checks and browser session regression
         run: |
           npm run typecheck
@@ -81,7 +83,9 @@ jobs:
           fi
       - name: Container diagnostics on failure
         if: failure()
-        run: docker compose -f docker-compose.prod.yml logs --no-color --tail 100
+        run: |
+          curl --silent --show-error http://127.0.0.1:8000/api/ready || true
+          docker compose -f docker-compose.prod.yml logs --no-color --tail 100
       - name: Stop isolated services
         if: always()
         run: docker compose -f docker-compose.prod.yml down --volumes
