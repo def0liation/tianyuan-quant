@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List
@@ -68,14 +69,21 @@ class StartupStatusRegistry:
             return None
         component_status = "OK"
         details = result if isinstance(result, dict) else None
-        if isinstance(result, dict) and str(result.get("status") or "").upper() == "SKIPPED":
-            component_status = "SKIPPED"
+        if isinstance(result, dict):
+            reported_status = str(result.get("status") or "").upper()
+            if reported_status == "SKIPPED":
+                component_status = "SKIPPED"
+            elif reported_status in {"ERROR", "FAILED", "FAILURE"}:
+                component_status = "ERROR"
         await self.finish_component(
             name,
             status=component_status,
             elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
             details=details,
         )
+        production = (os.getenv("APP_ENV") or os.getenv("ENVIRONMENT") or "").strip().lower() in {"prod", "production", "staging", "strict"}
+        if component_status == "ERROR" and required and (production or os.getenv("REQUIRE_DB_MIGRATIONS") == "1"):
+            raise RuntimeError(f"Required startup component failed: {name}")
         return result
 
     async def start_component(self, name: str, tier: str, *, required: bool = False) -> None:
@@ -128,15 +136,17 @@ class StartupStatusRegistry:
     async def mark_finished(self) -> None:
         async with self._lock:
             failed = [item for item in self._components.values() if item.get("status") == "ERROR"]
-            self._phase = "DEGRADED" if failed else "READY"
+            required_failed = any(item.get("required") for item in failed)
+            self._phase = "CORE_FAILED" if required_failed else ("DEGRADED" if failed else "READY")
 
     async def snapshot(self) -> Dict[str, Any]:
         async with self._lock:
             components: List[Dict[str, Any]] = [dict(item) for item in self._components.values()]
             phase = self._phase
         degraded = [item["name"] for item in components if item.get("status") == "ERROR"]
-        core_ready = phase in {"CORE_READY", "WARMING", "READY", "DEGRADED"}
-        ready = phase == "READY"
+        required_incomplete = any(item.get("required") and item.get("status") not in {"OK", "SKIPPED"} for item in components)
+        core_ready = phase in {"CORE_READY", "WARMING", "READY", "DEGRADED"} and not required_incomplete
+        ready = phase == "READY" and core_ready
         return {
             "phase": phase,
             "coreReady": core_ready,

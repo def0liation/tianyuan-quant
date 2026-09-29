@@ -70,10 +70,10 @@ deploy/backups/db/       # 数据库备份目录
 ## 存储降级
 
 如果数据库写入失败：
-- 内存 `runs_store` 仍保留数据
-- API 返回正常，但下次重启后数据丢失
-- 日志记录写入失败（不抛出异常）
-- 前端不因此白屏
+- run JSON artifact 已成功原子保存时，重启可从文件恢复；仅有内存对象不能视为 durable。
+- 部分 SQL materialization 的失败会记录运维日志并保留 JSON 降级路径，因此 API 返回 run 不证明所有业务表均写入成功。
+- JSON 写入失败不应继续报告持久化成功；参数扫描已明确在落盘失败时抛错且不调度。
+- SQL 镜像与文件快照的完整性需分别检查；不要用某个空表或 API 200 单独代替闭环验收。
 
 ## 数据读取
 
@@ -81,7 +81,7 @@ deploy/backups/db/       # 数据库备份目录
 
 - analysis run 详情优先来自内存 `runs_store` 和 `backend/app/storage/runs/*.json`，同时在 SQLite 中保留结构化记录和 report asset。
 - job 生命周期以 `analysis_jobs.json` + SQLite `analysis_jobs` 镜像并存，查询和 stale reconciliation 会尝试对账。
-- portfolio、backtest、research、case、knowledge、evaluation 已经以 SQLite store 为主。
+- portfolio、backtest 报告、research、case、knowledge version、evaluation 以 SQLite 为主；知识候选迭代与参数扫描任务仍分别以 `knowledge_iterations.json`、`backtest_parameter_scan_jobs.json` 为权威来源，不能用 SQL 空表推断这些模块没有历史。
 - auto paper trading config 仍在 `backend/app/storage/auto_paper_trading.json`，使用 atomic replace，并在损坏 JSON 时返回可解释 warning。
 
 新增闭环能力时，应优先把可查询状态写入 SQLite；JSON 只作为运行快照、兼容导入或可导出 artifact。不要让新能力只存在于内存对象中。
@@ -94,8 +94,10 @@ deploy/backups/db/       # 数据库备份目录
 | --- | --- | --- | --- |
 | Portfolio / holdings | SQLite `portfolio_snapshots`、`holding_positions` | 无权威角色 | 继续作为真实持仓闭环验收入口 |
 | Backtest | SQLite `backtest_runs`、`backtest_trades`、`backtest_signals` | 可导出 report artifact | 继续以 SQLite 为主，保留稳定 fingerprint 去重 |
+| Parameter scan jobs | `backtest_parameter_scan_jobs.json` 与其冷历史 manifest | 当前任务权威状态 | 落盘失败不得报告 durable 或调度；活动 lease 保留 |
 | Research Lab | SQLite `research_*` 表 | trace/import artifact | 继续以 SQLite 为主，保留 evidence links 和 workflow state |
 | Case / Knowledge / Evaluation | SQLite case/knowledge/evaluation 表 | 兼容 artifact | 继续以 SQLite 为主，发布后回归结果可查询 |
+| Knowledge iteration candidates | `knowledge_iterations.json` 与其冷历史 manifest | 当前候选审核状态 | ACTIVE 保持热存储，历史候选保留且可审核 |
 | Analysis run detail | 内存 + `backend/app/storage/runs/*.json`，SQLite 保留结构化镜像 | 当前主要 run artifact | 平台化阶段再设计更强 run snapshot 权威边界 |
 | Analysis jobs | `analysis_jobs.json` + SQLite `analysis_jobs` 镜像 | 运行态兼容和恢复线索 | 引入 worker/queue 前保持对账，后续迁向 SQLite job/attempt 权威 |
 | Auto paper runtime config | `backend/app/storage/auto_paper_trading.json` | 当前权威运行配置 | 后续若迁移需保留 atomic write、损坏 JSON warning 和审计 |
@@ -114,6 +116,8 @@ deploy/backups/db/       # 数据库备份目录
 - Product/E2E validation must use `.tmp` SQLite DBs. Do not write `storage/tianyuan_quant.db` for live smoke acceptance.
 
 ## Backup drill boundaries
+
+2026-09-29 的修复、历史归档配置、实际存储 bundle 工具和跨平台恢复限制见 [审计修复与运维说明](AUDIT_REMEDIATION_2026-09-29.md)。冷热归档默认不删除历史，也不替代异机备份；在线 SQLite 快照与同时复制的 JSON 不构成跨文件一致检查点。
 
 - `npm.cmd run smoke:db-backup-restore` covers temporary SQLite backup, restore dry-run, force restore, manifest checksum, and SQLite integrity verification.
 - `npm.cmd run smoke:db-offhost-backup` covers temporary SQLite backup file plus manifest copy into a separate simulated off-host directory and verifies the copied checksum against the manifest.

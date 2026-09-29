@@ -81,6 +81,7 @@ try {
   if ($Force) { $pythonArgs += "--force" }
   $python = Get-ProjectPython
   & $python @pythonArgs
+  if ($LASTEXITCODE -ne 0) { throw "SQLite restore helper failed with exit code $LASTEXITCODE." }
 }
 finally {
   Pop-Location

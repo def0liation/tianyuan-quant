@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
-from .file_utils import atomic_replace_file
+from .file_utils import atomic_replace_file, write_json_atomic
 from ..models.agent_runtime import (
     AgentDeployment,
     AgentLLMProfile,
@@ -1810,35 +1810,221 @@ def _runs_dir() -> Path:
     return RUNS_DIR
 
 
-def save_run(run_data: Dict[str, Any]) -> None:
-    run_id = run_data.get("runId", "")
-    if not run_id:
-        return
-    run_path = _runs_dir() / f"{run_id}.json"
-    run_path.write_text(
-        json.dumps(run_data, indent=2, ensure_ascii=False, default=str),
-        encoding="utf-8",
+def _parse_run_storage_timestamp(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        # Existing runs use local datetime.now() strings as well as aware UTC.
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def valid_run_storage_id(run_id: Any) -> bool:
+    return (
+        isinstance(run_id, str) and bool(run_id) and run_id not in {".", ".."}
+        and not any(character in run_id for character in ("/", "\\", ":", "\0"))
     )
 
 
+def save_run(run_data: Dict[str, Any]) -> None:
+    from . import analysis_job_store
+
+    run_id = run_data.get("runId", "")
+    if not run_id:
+        return
+    if not valid_run_storage_id(run_id):
+        raise ValueError("Invalid run id for local storage.")
+    with analysis_job_store.job_state_lock():
+        if is_run_hidden(run_id):
+            return
+        current = get_run(run_id)
+        current_job = analysis_job_store.get_job(run_id)
+        incoming_job = run_data.get("job") if isinstance(run_data.get("job"), dict) else {}
+        incoming_attempt = int(incoming_job.get("attempt") or 0)
+        incoming_job_id = str(incoming_job.get("job_id") or "")
+        incoming_status = str(run_data.get("status") or "").upper()
+        reject = False
+        if isinstance(current_job, dict):
+            durable_attempt = int(current_job.get("attempt") or 0)
+            durable_status = str(current_job.get("status") or "").upper()
+            reject = durable_attempt > incoming_attempt
+            if durable_attempt == incoming_attempt and incoming_job_id and current_job.get("job_id"):
+                reject = reject or incoming_job_id != current_job["job_id"]
+            if durable_attempt == incoming_attempt and durable_status in analysis_job_store.TERMINAL_JOB_STATUSES:
+                reject = reject or incoming_status != durable_status
+        if isinstance(current, dict):
+            stored_job = current.get("job") if isinstance(current.get("job"), dict) else {}
+            stored_attempt = int(stored_job.get("attempt") or 0)
+            stored_status = str(current.get("status") or "").upper()
+            reject = reject or stored_attempt > incoming_attempt
+            if stored_attempt == incoming_attempt and incoming_job_id and stored_job.get("job_id"):
+                reject = reject or incoming_job_id != stored_job["job_id"]
+            if stored_attempt == incoming_attempt and stored_status in analysis_job_store.TERMINAL_JOB_STATUSES:
+                reject = reject or incoming_status != stored_status
+            if stored_attempt == incoming_attempt:
+                stored_at = _parse_run_storage_timestamp(current.get("updatedAt"))
+                incoming_at = _parse_run_storage_timestamp(run_data.get("updatedAt"))
+                reject = reject or bool(stored_at and incoming_at and incoming_at < stored_at)
+        if reject:
+            if isinstance(current, dict):
+                run_data.clear()
+                run_data.update(current)
+            return
+        write_json_atomic(_runs_dir() / f"{run_id}.json", run_data)
+
+
 def get_run(run_id: str) -> Dict[str, Any] | None:
-    run_path = _runs_dir() / f"{run_id}.json"
-    if not run_path.exists():
+    from . import analysis_job_store
+
+    if not valid_run_storage_id(run_id):
         return None
-    with run_path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    with analysis_job_store.job_state_lock():
+        run_path = _runs_dir() / f"{run_id}.json"
+        if run_path.exists():
+            with run_path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+        return _get_archived_run(run_id)
 
 
 def list_runs() -> list[Dict[str, Any]]:
-    result = []
-    runs_dir = _runs_dir()
-    for f in sorted(runs_dir.glob("RUN_*.json"), reverse=True):
-        try:
-            data = json.loads(f.read_text(encoding="utf-8"))
-            result.append(data)
-        except (json.JSONDecodeError, OSError):
-            pass
-    return result
+    from . import analysis_job_store
+    from .cold_archive import load_records
+
+    with analysis_job_store.job_state_lock():
+        manifest = _load_run_archive_manifest()
+        hidden = set(manifest.get("hidden_run_ids", []))
+        result = {run_id: run for run_id, run in load_records(_run_archive_dir(), manifest).items() if run_id not in hidden}
+        for path in _runs_dir().glob("RUN_*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                result[path.stem] = data
+            except (json.JSONDecodeError, OSError):
+                pass
+        return [result[run_id] for run_id in sorted(result, reverse=True)]
+
+
+def _run_archive_dir() -> Path:
+    return RUNS_DIR / ".archive"
+
+
+def _load_run_archive_manifest() -> Dict[str, Any]:
+    from .cold_archive import StorageCorruptionError, empty_manifest
+
+    path = _run_archive_dir() / "manifest.json"
+    if not path.exists():
+        return empty_manifest()
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise StorageCorruptionError("Run archive manifest cannot be loaded.") from exc
+    if not isinstance(manifest, dict) or manifest.get("schema") != empty_manifest()["schema"] or not isinstance(manifest.get("batches"), list):
+        raise StorageCorruptionError("Invalid run archive manifest.")
+    if "run_index" in manifest and not isinstance(manifest["run_index"], dict):
+        raise StorageCorruptionError("Invalid run archive index.")
+    if not isinstance(manifest.get("hidden_run_ids", []), list) or any(not isinstance(item, str) for item in manifest.get("hidden_run_ids", [])):
+        raise StorageCorruptionError("Invalid run archive visibility metadata.")
+    return manifest
+
+
+def is_run_hidden(run_id: str) -> bool:
+    if not valid_run_storage_id(run_id):
+        return False
+    return not (RUNS_DIR / f"{run_id}.json").exists() and run_id in _load_run_archive_manifest().get("hidden_run_ids", [])
+
+
+def _get_archived_run(run_id: str) -> Dict[str, Any] | None:
+    from .cold_archive import StorageCorruptionError, load_records
+
+    manifest = _load_run_archive_manifest()
+    if run_id in manifest.get("hidden_run_ids", []):
+        return None
+    index = manifest.get("run_index")
+    if isinstance(index, dict):
+        name = index.get(run_id)
+        if name is None:
+            return None
+        batch = next((item for item in manifest["batches"] if isinstance(item, dict) and item.get("file") == name), None)
+        if batch is None:
+            raise StorageCorruptionError("Run archive index references a missing batch.")
+        manifest = {**manifest, "batches": [batch], "pending_records": {}}
+    return load_records(_run_archive_dir(), manifest).get(run_id)
+
+
+def archive_terminal_runs(*, max_hot: int = 1000, dry_run: bool = True) -> Dict[str, Any]:
+    """Explicit maintenance: preserve all history, and preview changes by default.
+
+    Only terminal runs without an active job are eligible. Hashed immutable
+    batches and the atomic manifest are durable before any hot copy is removed.
+    """
+    from . import analysis_job_store
+    from .cold_archive import StorageCorruptionError, append_batch, load_records
+
+    max_hot = max(1, int(max_hot))
+    with analysis_job_store.job_state_lock():
+        manifest = _load_run_archive_manifest()
+        load_records(_run_archive_dir(), manifest)
+        job_state = analysis_job_store._load_state()
+        if job_state.get("warning") or not isinstance(job_state.get("jobs"), dict):
+            raise StorageCorruptionError("Run archiving requires readable job state.")
+        active_ids = {
+            run_id for run_id, job in job_state["jobs"].items()
+            if isinstance(job, dict) and job.get("status") in analysis_job_store.ACTIVE_JOB_STATUSES
+        }
+        db_file = analysis_job_store._sqlite_file()
+        if db_file is not None and db_file.exists():
+            with analysis_job_store._sqlite_connect() as conn:
+                if conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'analysis_jobs'").fetchone():
+                    active_ids.update(row["run_id"] for row in conn.execute("SELECT run_id, status FROM analysis_jobs") if row["status"] in analysis_job_store.ACTIVE_JOB_STATUSES)
+        files = list(_runs_dir().glob("RUN_*.json"))
+        eligible = []
+        unreadable_count = 0
+        for path in files:
+            try:
+                raw = path.read_bytes()
+                run = json.loads(raw)
+            except (OSError, ValueError):
+                unreadable_count += 1
+                continue
+            if not isinstance(run, dict) or run.get("runId") != path.stem:
+                unreadable_count += 1
+                continue
+            if run.get("status") in analysis_job_store.TERMINAL_JOB_STATUSES and path.stem not in active_ids:
+                eligible.append((path, run, raw))
+        eligible.sort(key=lambda item: (str(item[1].get("updatedAt") or item[1].get("createdAt") or ""), item[0].stem))
+        protected_count = len(files) - len(eligible)
+        target = max(protected_count, max(1, max_hot * 3 // 4))
+        selected = eligible[:max(0, len(files) - target)] if len(files) > max_hot else []
+        report = {
+            "dry_run": bool(dry_run), "max_hot": max_hot, "hot_count": len(files),
+            "protected_count": protected_count, "unreadable_count": unreadable_count,
+            "candidate_run_ids": [path.stem for path, _, _ in selected],
+            "archived_count": 0, "hot_files_remaining": len(files), "hot_cleanup_failed": [],
+            "deletion_enabled": False,
+        }
+        if dry_run or not selected:
+            return report
+        records = {path.stem: run for path, run, _ in selected}
+        next_manifest = append_batch(_run_archive_dir(), manifest, records, force_flush=True)
+        batch = next_manifest["batches"][-1]
+        buffered_ids = set(manifest.get("pending_records", {})) | set(records)
+        next_manifest["run_index"] = {**manifest.get("run_index", {}), **{run_id: batch["file"] for run_id in buffered_ids}}
+        next_manifest["hidden_run_ids"] = [run_id for run_id in manifest.get("hidden_run_ids", []) if run_id not in records]
+        write_json_atomic(_run_archive_dir() / "manifest.json", next_manifest)
+        verified = load_records(_run_archive_dir(), {**next_manifest, "batches": [batch], "pending_records": {}})
+        if any(verified.get(run_id) != run for run_id, run in records.items()):
+            raise StorageCorruptionError("Run archive verification failed; hot copies were preserved.")
+        for path, _, raw in selected:
+            try:
+                if path.read_bytes() == raw:
+                    path.unlink()
+                else:
+                    report["hot_cleanup_failed"].append(path.stem)
+            except OSError:
+                report["hot_cleanup_failed"].append(path.stem)
+        report["archived_count"] = len(records)
+        report["hot_files_remaining"] = len(list(_runs_dir().glob("RUN_*.json")))
+        return report
 
 
 def load_persisted_runs() -> Dict[str, Dict[str, Any]]:
@@ -1851,11 +2037,21 @@ def load_persisted_runs() -> Dict[str, Dict[str, Any]]:
 
 
 def delete_run(run_id: str) -> bool:
-    run_path = _runs_dir() / f"{run_id}.json"
-    if run_path.exists():
+    from . import analysis_job_store
+
+    if not valid_run_storage_id(run_id):
+        return False
+    with analysis_job_store.job_state_lock():
+        run_path = _runs_dir() / f"{run_id}.json"
         try:
-            run_path.unlink()
-            return True
+            archived = _get_archived_run(run_id)
+            if archived is not None:
+                manifest = _load_run_archive_manifest()
+                manifest["hidden_run_ids"] = sorted(set(manifest.get("hidden_run_ids", [])) | {run_id})
+                write_json_atomic(_run_archive_dir() / "manifest.json", manifest)
+            if run_path.exists():
+                run_path.unlink()
+                return True
+            return archived is not None
         except OSError:
             return False
-    return False

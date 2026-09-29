@@ -291,7 +291,8 @@ class AuthorizedRestMarketDataAdapter(BaseMarketDataAdapter):
                 base_url=base_url,
                 quote_path=endpoint,
                 api_key=self._api_key(),
-            )
+            ),
+            endpoint=url,
         )
         request = Request(url, headers=self._headers(), method="GET")
         with urlopen(request, timeout=self.timeout_seconds) as response:

@@ -66,8 +66,8 @@ def market_data_egress_strict_enabled() -> bool:
     return app_env in PRODUCTION_ENVIRONMENTS
 
 
-def validate_market_data_egress(profile: Any) -> MarketDataEgressDecision:
-    endpoint = _profile_endpoint(profile)
+def validate_market_data_egress(profile: Any, *, endpoint: str | None = None) -> MarketDataEgressDecision:
+    endpoint = _profile_endpoint(profile) if endpoint is None else str(endpoint)
     provider = str(getattr(profile, "provider", "") or "").strip().lower()
     has_key = bool(str(getattr(profile, "api_key", "") or "").strip())
     strict_mode = market_data_egress_strict_enabled()
@@ -80,9 +80,12 @@ def validate_market_data_egress(profile: Any) -> MarketDataEgressDecision:
             strict_mode=strict_mode,
         )
 
-    parsed = urlparse(endpoint)
-    host = (parsed.hostname or "").lower()
-    scheme = (parsed.scheme or "").lower()
+    try:
+        parsed = urlparse(endpoint)
+        host = (parsed.hostname or "").lower()
+        scheme = (parsed.scheme or "").lower()
+    except ValueError:
+        return _blocked(host="", reason="invalid_base_url", message="Market data outbound request blocked: invalid URL.")
 
     if not strict_mode:
         return MarketDataEgressDecision(
@@ -143,8 +146,8 @@ def validate_market_data_egress(profile: Any) -> MarketDataEgressDecision:
     )
 
 
-def assert_market_data_egress_allowed(profile: Any) -> MarketDataEgressDecision:
-    decision = validate_market_data_egress(profile)
+def assert_market_data_egress_allowed(profile: Any, *, endpoint: str | None = None) -> MarketDataEgressDecision:
+    decision = validate_market_data_egress(profile, endpoint=endpoint)
     if not decision.allowed:
         raise MarketDataEgressBlockedError(decision)
     return decision

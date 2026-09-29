@@ -365,6 +365,8 @@ async def test_ops_log_time_based_retention_prunes_old_events(monkeypatch, tmp_p
 
 @pytest.mark.asyncio
 async def test_ready_reports_degraded_when_dependency_check_fails(monkeypatch):
+    await startup_status.reset()
+    await startup_status.mark_core_ready()
     async def fake_database_check():
         return {"status": "error", "message": "db unavailable"}
 

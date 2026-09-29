@@ -24,6 +24,14 @@ _persist_run: PersistRun | None = None
 _compare_runs: CompareRuns | None = None
 
 
+def initialize_analysis_lifecycle() -> None:
+    """Register analysis callbacks for a worker without starting the HTTP app."""
+    if _run_store_provider is None:
+        from ..analysis_bootstrap import bind_analysis_callbacks
+        bind_analysis_callbacks()
+    _ensure_bound()
+
+
 def bind_analysis_lifecycle(
     *,
     run_store_provider: RunStoreProvider,
@@ -112,10 +120,15 @@ def mark_run_cancelled(run_id: str, run: dict, reason: str) -> None:
     _mark_run_cancelled(run_id, run, reason)
 
 
-async def execute_and_persist_run(run_id: str, *, worker_id: str | None = None) -> None:
+async def execute_and_persist_run(
+    run_id: str, *, worker_id: str | None = None, expected_job_id: str | None = None,
+) -> None:
     _ensure_bound()
     assert _execute_and_persist_run is not None
-    await _execute_and_persist_run(run_id, worker_id=worker_id)
+    if expected_job_id is None:
+        await _execute_and_persist_run(run_id, worker_id=worker_id)
+    else:
+        await _execute_and_persist_run(run_id, worker_id=worker_id, expected_job_id=expected_job_id)
 
 
 async def create_run(request: Any) -> Any:

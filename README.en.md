@@ -22,7 +22,7 @@ The current version is a research and simulation environment. SignalOps actions 
 
 ## Quick start
 
-Install Node.js 20+, npm, and Python 3.11+. The Windows launcher requires PowerShell. `uv` can assist with Python environments and tests. Dependency installation accesses package registries. Live market data and LLM analysis depend on provider configuration and authorization; personal accounts are not included.
+Install Node.js 20+, npm, and Python 3.13. The Windows launcher requires PowerShell. `uv` can assist with Python environments and tests. Dependency installation accesses package registries. Live market data and LLM analysis depend on provider configuration and authorization; personal accounts are not included.
 
 ```powershell
 git clone https://github.com/def0liation/tianyuan-quant.git
@@ -46,7 +46,7 @@ For macOS / Linux, the source entry points can be started in two terminals. Thes
 ```bash
 # Terminal 1: backend
 python3 -m venv backend/.venv
-backend/.venv/bin/python -m pip install -r backend/requirements.txt
+backend/.venv/bin/python -m pip install --require-hashes -r backend/requirements.lock
 cd backend
 .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
@@ -101,7 +101,7 @@ npm.cmd run test:backend:all
 
 ## Current limitations
 
-This publication validates local Windows source and tests. Linux/macOS, Docker deployment, and live data services have not been accepted as verified. The current `Dockerfile` does not copy `backend/alembic.ini`; complete the migration configuration before production startup rather than treating example deployment files as a validated production release. Some backend dependencies use version ranges, and there is no complete Python lockfile.
+Current validation covers Windows source and isolated tests. Docker now includes migration configuration, the Python 3.13 hash lockfile, and readiness checks. CI includes Windows regressions and Linux container startup checks, but the new workflow has not run on GitHub. Linux/macOS, actual Docker startup, and live providers remain unverified. See the [audit remediation and operations notes](docs/AUDIT_REMEDIATION_2026-09-29.md) for history retention and recovery boundaries.
 
 ## License
 

@@ -21,6 +21,7 @@ from ..core import (
     analysis_run_start,
 )
 from ..core.analysis_lifecycle_service import bind_analysis_lifecycle
+from ..core.file_utils import write_json_atomic
 from ..core.analysis_dashboard_summary import build_analysis_dashboard_summary
 from ..core.analysis_run_registry import bind_analysis_run_store
 from ..core.data_pipeline import compression_artifact_path, mark_summary_persisted, summarize_run
@@ -672,6 +673,7 @@ def _parse_run_timestamp(value: object) -> datetime | None:
     return parsed
 
 
+@analysis_job_store._serialized_job_state
 def _recover_stale_running_runs(
     store: dict[str, dict],
     *,
@@ -685,10 +687,25 @@ def _recover_stale_running_runs(
     stale_after = stale_after or _analysis_run_stale_after()
     active_run_ids = active_run_ids or set()
     orphaned_after = orphaned_after or _analysis_run_orphaned_after()
+    if analysis_job_store._load_state().get("warning"):
+        return 0
     recovered = 0
     for run_id, run in list(store.items()):
         if not isinstance(run, dict):
             continue
+        if run_id not in active_run_ids:
+            persisted = agent_runtime_store.get_run(run_id)
+            if isinstance(persisted, dict):
+                run.clear()
+                run.update(persisted)
+        current_job = analysis_job_store.get_job(run_id)
+        if current_job:
+            run["job"] = current_job
+            if current_job.get("status") in analysis_job_store.TERMINAL_JOB_STATUSES:
+                continue
+            lease_expires_at = _parse_run_timestamp(current_job.get("lease_expires_at"))
+            if current_job.get("status") in analysis_job_store.LEASE_PROTECTED_JOB_STATUSES and lease_expires_at and now < lease_expires_at:
+                continue
         if run.get("status") not in STALE_RECOVERABLE_RUN_STATUSES:
             continue
         if _is_legacy_mock_run(run_id, run):
@@ -706,7 +723,8 @@ def _recover_stale_running_runs(
             stale_timeout = orphaned_after
         if not is_stale:
             continue
-        _mark_run_stale(run_id, run, now, stale_timeout, source)
+        if not _mark_run_stale(run_id, run, now, stale_timeout, source):
+            continue
         try:
             save_run(run)
         except Exception:
@@ -761,7 +779,7 @@ def _mark_run_stale(
     now: datetime,
     stale_after: timedelta,
     source: str,
-) -> None:
+) -> bool:
     recovered_at = now.isoformat()
     last_updated_at = run.get("updatedAt") or run.get("createdAt") or ""
     status_before = str(run.get("status") or "RUNNING")
@@ -782,6 +800,11 @@ def _mark_run_stale(
         "auditId": audit_id,
     }
 
+    job = analysis_job_store.mark_stale(run_id, reason, _failed_node_from_run(run), operator="watchdog")
+    if job.get("status") != STALE_RUN_STATUS or job.get("state_update_rejected"):
+        run["job"] = job
+        return False
+
     run["status"] = STALE_RUN_STATUS
     run["failureCategory"] = "STALE_RUN_RECOVERY"
     run["failReason"] = reason
@@ -797,7 +820,6 @@ def _mark_run_stale(
             node["status"] = "FAIL"
             node.setdefault("downgradeReasons", []).append(reason)
 
-    job = analysis_job_store.mark_stale(run_id, reason, _failed_node_from_run(run), operator="watchdog")
     run["job"] = job
 
     run.setdefault("streamEvents", []).append(
@@ -825,6 +847,7 @@ def _mark_run_stale(
             "auditId": audit_id,
         }
     )
+    return True
 
 
 def _active_analysis_task_run_ids() -> set[str]:
@@ -877,6 +900,7 @@ def _loaded_recoverable_runs(run_ids: set[str] | None = None) -> dict[str, dict]
         run_id = str(run.get("runId") or store_run_id)
         if requested_run_ids and run_id not in requested_run_ids and store_run_id not in requested_run_ids:
             continue
+        run = _get_run_or_load(run_id) or run
         status = str(run.get("status") or "").upper()
         if run_id in active_run_ids or status in STALE_RECOVERABLE_RUN_STATUSES:
             selected[run_id] = run
@@ -1004,7 +1028,7 @@ async def _ensure_run_framework_ready(run_id: str, run: dict) -> bool:
 
 RUN_SUMMARY_INDEX_NAME = "analysis_run_index.json"
 runs_store: dict[str, dict] = {}
-bind_analysis_run_store(lambda: runs_store, _is_legacy_mock_run)
+bind_analysis_run_store(lambda: runs_store, _is_legacy_mock_run, loader=lambda run_id: _get_run_or_load(run_id))
 analysis_tasks: dict[str, asyncio.Task] = {}
 _analysis_history_loaded = False
 _analysis_history_loading = False
@@ -1067,13 +1091,7 @@ def _write_summary_index(summaries: list[dict]) -> None:
     path = _history_index_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = _sort_summaries(summaries)
-    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-        os.replace(tmp_path, path)
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
+    write_json_atomic(path, payload)
 
 
 def _index_with_run_summary(run: dict) -> list[dict]:
@@ -1135,6 +1153,7 @@ def _summaries_with_loaded_overrides(
     return _sort_summaries(list(by_id.values()))
 
 
+@analysis_job_store._serialized_job_state
 def save_run(run_data: dict) -> None:
     agent_runtime_store.save_run(run_data)
     try:
@@ -1145,20 +1164,30 @@ def save_run(run_data: dict) -> None:
 
 def delete_run(run_id: str) -> bool:
     deleted = agent_runtime_store.delete_run(run_id)
-    try:
-        _remove_run_from_summary_index(run_id)
-    except Exception:
-        logger.exception("Failed to remove analysis run summary index entry for %s", run_id)
+    if deleted:
+        try:
+            _remove_run_from_summary_index(run_id)
+        except Exception:
+            logger.exception("Failed to remove analysis run summary index entry for %s", run_id)
     return deleted
 
 
 def _get_run_or_load(run_id: str) -> dict | None:
+    if not agent_runtime_store.valid_run_storage_id(run_id):
+        return None
+    if agent_runtime_store.is_run_hidden(run_id):
+        runs_store.pop(run_id, None)
+        return None
     run = runs_store.get(run_id)
-    if isinstance(run, dict):
+    if isinstance(run, dict) and run_id in _active_analysis_task_run_ids():
         return run
     loaded = agent_runtime_store.get_run(run_id)
     if not isinstance(loaded, dict) or _is_legacy_mock_run(run_id, loaded):
-        return None
+        return run if isinstance(run, dict) else None
+    if isinstance(run, dict):
+        run.clear()
+        run.update(loaded)
+        return run
     runs_store[run_id] = loaded
     return loaded
 
@@ -1332,7 +1361,9 @@ async def start_analysis_run(run_id: str, payload: dict | None = None):
     if not start_result.should_schedule_background_task:
         return StartAnalysisResponse(run_id=run_id, status=start_result.status)
 
-    analysis_tasks[run_id] = asyncio.create_task(_execute_and_persist_run(run_id))
+    analysis_tasks[run_id] = asyncio.create_task(
+        _execute_and_persist_run(run_id, expected_job_id=str((run.get("job") or {}).get("job_id") or ""))
+    )
 
     return StartAnalysisResponse(
         run_id=run_id,
@@ -1444,7 +1475,13 @@ async def retry_analysis_run(run_id: str = Path(..., pattern=RUN_ID_PATH_PATTERN
         if hydrated is not run:
             run.clear()
             run.update(hydrated)
-    save_run(run)
+    with analysis_job_store.job_state_lock():
+        run["job"] = analysis_job_store.start_job(
+            run_id,
+            retry_from_node_id=str((run.get("retry") or {}).get("from_node_id") or ""),
+            operator=operator,
+        )
+        save_run(run)
     return await start_analysis_run(run_id, {"operator": operator})
 
 
@@ -1545,8 +1582,9 @@ async def delete_analysis_run(run_id: str = Path(..., pattern=RUN_ID_PATH_PATTER
     if _get_run_or_load(run_id) is None:
         raise HTTPException(status_code=404, detail="Run not found")
 
+    if not delete_run(run_id):
+        raise HTTPException(status_code=409, detail="Run could not be deleted; persisted history was retained.")
     runs_store.pop(run_id, None)
-    delete_run(run_id)
 
     try:
         repo = RunRepository()
@@ -1755,13 +1793,13 @@ async def _persist_run(run_data: dict, run_id: str, symbol: str):
 
 
 def _job_lease_update_rejected(job: dict | None) -> bool:
-    return isinstance(job, dict) and bool(job.get("lease_update_rejected"))
+    return isinstance(job, dict) and bool(job.get("lease_update_rejected") or job.get("state_update_rejected"))
 
 
 def _restore_persisted_run_after_lease_rejection(run_id: str, rejected_job: dict) -> None:
     current_job = analysis_job_store.get_job(run_id) or rejected_job
     logger.warning(
-        "Rejected analysis job update for run %s due to worker lease owner mismatch: current=%s attempted=%s event=%s",
+        "Rejected analysis job update for run %s because durable state/lease changed: current=%s attempted=%s event=%s",
         run_id,
         rejected_job.get("current_worker_id"),
         rejected_job.get("attempted_worker_id"),
@@ -1777,11 +1815,26 @@ def _restore_persisted_run_after_lease_rejection(run_id: str, rejected_job: dict
         runs_store[run_id]["job"] = current_job
 
 
-async def _execute_and_persist_run(run_id: str, *, worker_id: str | None = None):
+async def _execute_and_persist_run(
+    run_id: str, *, worker_id: str | None = None, expected_job_id: str | None = None,
+):
     execution_worker_id = worker_id or analysis_job_store.DEFAULT_WORKER_ID
+    execution_job_id = expected_job_id
     try:
         run_data = _get_run_or_load(run_id)
         if run_data:
+            initial_job = analysis_job_store.get_job(run_id) or run_data.get("job") or {}
+            execution_job_id = expected_job_id or str((run_data.get("job") or initial_job).get("job_id") or "")
+            rejected = analysis_job_store._reject_if_worker_mismatch(
+                initial_job,
+                worker_id=execution_worker_id,
+                actor="analysis_worker",
+                event="EXECUTION_START",
+                expected_job_id=execution_job_id,
+            )
+            if rejected:
+                _restore_persisted_run_after_lease_rejection(run_id, rejected)
+                return
             if await _ensure_run_framework_ready(run_id, run_data):
                 save_run(run_data)
             pending_job = analysis_job_store.get_job(run_id) or run_data.get("job") or {}
@@ -1791,6 +1844,7 @@ async def _execute_and_persist_run(run_id: str, *, worker_id: str | None = None)
                     run_id,
                     run_data.get("failReason") or "cancelled_before_execution",
                     worker_id=execution_worker_id,
+                    expected_job_id=execution_job_id,
                 )
                 if _job_lease_update_rejected(job):
                     _restore_persisted_run_after_lease_rejection(run_id, job)
@@ -1807,7 +1861,7 @@ async def _execute_and_persist_run(run_id: str, *, worker_id: str | None = None)
                 return
             run_data["status"] = "RUNNING"
             run_data["updatedAt"] = datetime.now().isoformat()
-            job = analysis_job_store.mark_running(run_id, worker_id=execution_worker_id)
+            job = analysis_job_store.mark_running(run_id, worker_id=execution_worker_id, expected_job_id=execution_job_id)
             if _job_lease_update_rejected(job):
                 _restore_persisted_run_after_lease_rejection(run_id, job)
                 return
@@ -1833,6 +1887,7 @@ async def _execute_and_persist_run(run_id: str, *, worker_id: str | None = None)
                 run_id,
                 run_data.get("failReason") or "cancelled_by_user",
                 worker_id=execution_worker_id,
+                expected_job_id=execution_job_id,
             )
             if _job_lease_update_rejected(job):
                 _restore_persisted_run_after_lease_rejection(run_id, job)
@@ -1854,16 +1909,18 @@ async def _execute_and_persist_run(run_id: str, *, worker_id: str | None = None)
                 run_id,
                 "Run disappeared during execution.",
                 worker_id=execution_worker_id,
+                expected_job_id=execution_job_id,
             )
             return
         status = run_data.get("status")
         if status == "COMPLETED":
-            job = analysis_job_store.mark_completed(run_id, worker_id=execution_worker_id)
+            job = analysis_job_store.mark_completed(run_id, worker_id=execution_worker_id, expected_job_id=execution_job_id)
         elif status == "CANCELLED":
             job = analysis_job_store.mark_cancelled(
                 run_id,
                 run_data.get("failReason") or "cancelled",
                 worker_id=execution_worker_id,
+                expected_job_id=execution_job_id,
             )
         elif status == "FAILED":
             job = analysis_job_store.mark_failed(
@@ -1871,6 +1928,7 @@ async def _execute_and_persist_run(run_id: str, *, worker_id: str | None = None)
                 run_data.get("failReason") or "Analysis run failed.",
                 _failed_node_from_run(run_data),
                 worker_id=execution_worker_id,
+                expected_job_id=execution_job_id,
             )
         else:
             job = analysis_job_store.get_job(run_id) or run_data.get("job")
@@ -1917,6 +1975,7 @@ async def _execute_and_persist_run(run_id: str, *, worker_id: str | None = None)
                 run_id,
                 run_data.get("failReason") or "cancelled_by_user",
                 worker_id=execution_worker_id,
+                expected_job_id=execution_job_id,
             )
             if _job_lease_update_rejected(job):
                 _restore_persisted_run_after_lease_rejection(run_id, job)
@@ -1945,6 +2004,7 @@ async def _execute_and_persist_run(run_id: str, *, worker_id: str | None = None)
                 str(exc) or runs_store[run_id]["failReason"],
                 _failed_node_from_run(runs_store[run_id]),
                 worker_id=execution_worker_id,
+                expected_job_id=execution_job_id,
             )
             if _job_lease_update_rejected(job):
                 _restore_persisted_run_after_lease_rejection(run_id, job)
@@ -1970,7 +2030,9 @@ bind_analysis_lifecycle(
     load_run=lambda run_id: _get_run_or_load(run_id),
     save_run=lambda run_data: save_run(run_data),
     mark_run_cancelled=lambda run_id, run_data, reason: _mark_run_cancelled(run_id, run_data, reason),
-    execute_and_persist_run=lambda run_id, worker_id=None: _execute_and_persist_run(run_id, worker_id=worker_id),
+    execute_and_persist_run=lambda run_id, worker_id=None, expected_job_id=None: _execute_and_persist_run(
+        run_id, worker_id=worker_id, expected_job_id=expected_job_id,
+    ),
     create_run=lambda request: create_analysis_run(request),
     start_run=lambda run_id, payload=None: start_analysis_run(run_id, payload),
     persist_run=lambda run_data, run_id, symbol: _persist_run(run_data, run_id, symbol),

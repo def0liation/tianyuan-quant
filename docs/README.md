@@ -38,6 +38,7 @@ Root npm scripts invoke `npm.cmd` / `powershell.exe`. Linux/macOS frontend comma
 | [MFE_MAE_PATH_RISK_FILTER_DEV_GUIDE.md](MFE_MAE_PATH_RISK_FILTER_DEV_GUIDE.md) | MFE/MAE 只读研究输出和风险过滤边界 / Read-only MFE/MAE research outputs and path-risk boundaries |
 | [SIGNALOPS_DECISION_TREE_GUIDE.md](SIGNALOPS_DECISION_TREE_GUIDE.md) | 日K模拟决策生命周期、复盘和知识候选 / Daily-K simulation lifecycle, review, and knowledge candidates |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | Docker、授权、备份和运行要求；部署不代表实盘能力 / Docker, authorization, backup, and operating requirements; deployment does not enable live trading |
+| [AUDIT_REMEDIATION_2026-09-29.md](AUDIT_REMEDIATION_2026-09-29.md) | 审计修复、完整历史归档、备份边界和发布验证 / Audit fixes, complete history retention, recovery boundaries, and release checks |
 | [PORTABLE_PACKAGE.md](PORTABLE_PACKAGE.md) | Windows portable zip 的制作和使用 / Building and using a Windows portable zip |
 
 ## API、数据与 Agent 契约 / API, data, and agent contracts

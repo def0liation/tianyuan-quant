@@ -12,6 +12,7 @@
 .tmp/
 .worktrees/
 .agents/
+.workbuddy/
 .claude/
 .codex/
 .superpowers/
@@ -30,6 +31,7 @@ storage/
 backend/storage/
 deploy/db/
 deploy/backend-storage/
+deploy/backups/
 docs/MODULE_INTERACTION_REVIEW_LOG.md
 output/
 backend/.uv-runtime-cache/
@@ -49,6 +51,8 @@ dist/
 frontend/node_modules/
 frontend/dist/
 backend/.venv/
+# Local runtime state, including cold archives and lock sidecars.
+backend/app/storage/
 backend/app/storage/*.db
 backend/app/storage/*.sqlite
 backend/app/storage/*.sqlite3

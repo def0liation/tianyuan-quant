@@ -22,7 +22,7 @@
 
 ## 快速开始
 
-准备 Node.js 20+、npm 和 Python 3.11+。Windows 启动器需要 PowerShell；`uv` 可作为 Python 环境与测试的辅助工具。安装依赖会访问软件包仓库。真实行情或 LLM 分析能力取决于各提供方的配置和授权，不附带个人账号。
+准备 Node.js 20+、npm 和 Python 3.13。Windows 启动器需要 PowerShell；`uv` 可作为 Python 环境与测试的辅助工具。安装依赖会访问软件包仓库。真实行情或 LLM 分析能力取决于各提供方的配置和授权，不附带个人账号。
 
 ```powershell
 git clone https://github.com/def0liation/tianyuan-quant.git
@@ -46,7 +46,7 @@ macOS / Linux 可在两个终端分别启动，下面是源码入口命令；本
 ```bash
 # Terminal 1: backend
 python3 -m venv backend/.venv
-backend/.venv/bin/python -m pip install -r backend/requirements.txt
+backend/.venv/bin/python -m pip install --require-hashes -r backend/requirements.lock
 cd backend
 .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
@@ -101,7 +101,7 @@ npm.cmd run test:backend:all
 
 ## 当前限制
 
-本次整理验证以 Windows 本地源码和测试为范围。Linux/macOS、Docker 部署和真实数据服务尚未验收。现有 `Dockerfile` 未复制 `backend/alembic.ini`，生产启动的迁移配置需要先补齐；不要将示例部署文件直接视为已验证的生产发布。后端部分依赖采用范围版本，尚无完整 Python 锁文件。
+当前验证以 Windows 本地源码和隔离测试为范围。Docker 已补齐迁移配置、Python 3.13 哈希锁文件和 readiness；CI 包含 Windows 回归及 Linux 容器启动检查。新增 CI 尚未在 GitHub 执行，Linux/macOS、Docker 实际启动和真实数据服务仍未验收。运维与历史保留规则见 [审计修复与运维说明](docs/AUDIT_REMEDIATION_2026-09-29.md)。
 
 ## 许可证
 

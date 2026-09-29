@@ -10,6 +10,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .cold_archive import (
+    StorageCorruptionError, append_batch, archive_dir, empty_manifest, hot_limit,
+    load_records, quarantine_file,
+)
+from .file_utils import file_state_lock, write_json_atomic, write_text_atomic
+
 
 DEFAULT_MAX_EVENTS = 1000
 MAX_RETENTION_DAYS = 3650
@@ -113,8 +119,10 @@ class OpsEventLog:
     """
 
     def __init__(self, max_events: int = DEFAULT_MAX_EVENTS) -> None:
-        self._max_events = max(100, int(max_events or DEFAULT_MAX_EVENTS))
+        self._max_events = max(100, hot_limit("OPS_LOG_MAX_EVENTS", int(max_events or DEFAULT_MAX_EVENTS)))
         self._lock = threading.RLock()
+        self._invalid_lines: list[int] = []
+        self._loaded_bytes = b""
 
     def log_file(self) -> Path:
         configured = os.getenv("OPS_LOG_FILE", "").strip()
@@ -198,6 +206,7 @@ class OpsEventLog:
             "counts_by_level": by_level,
             "counts_by_type": by_type,
             "retention_policy": self.retention_policy(),
+            "storage_integrity": self.storage_integrity(),
             "redaction_policy": self.redaction_policy(),
             "handoff_status": self.handoff_status(),
             "latest": list(reversed(latest)),
@@ -213,7 +222,7 @@ class OpsEventLog:
         text: str = "",
         since: str = "",
     ) -> dict[str, Any]:
-        events = self._read_events()
+        events = self._read_history_events()
         normalized_level = _filter_level(level) if level else ""
         event_type_filter = _safe_text(event_type, 80).lower()
         source_filter = _safe_text(source, 80).lower()
@@ -259,6 +268,7 @@ class OpsEventLog:
             "text_filter": text_filter,
             "since": since if since_dt is not None else "",
             "retention_policy": self.retention_policy(),
+            "storage_integrity": self.storage_integrity(),
             "redaction_policy": self.redaction_policy(),
             "events": list(reversed(returned)),
         }
@@ -539,6 +549,7 @@ class OpsEventLog:
             "since": since if since_dt is not None else "",
             "checksum": _export_checksum(exported),
             "retention_policy": self.retention_policy(),
+            "storage_integrity": self.storage_integrity(),
             "redaction_policy": self.redaction_policy(),
             "events": exported,
         }
@@ -638,7 +649,69 @@ class OpsEventLog:
             "time_based_retention_enabled": time_based_enabled,
             "max_age_days": retention_days,
             "prune_on_read_or_write": time_based_enabled,
+            "archive_on_read_or_write": True,
+            "archive_dir": str(archive_dir(self.log_file(), "OPS_LOG_ARCHIVE_DIR")),
+            "preserve_all_history": True,
+            "deletion_enabled": False,
+            "hot_low_watermark": max(1, self._max_events * 3 // 4),
+            "history_query_includes_archive": True,
         }
+
+    def _archive_manifest_file(self) -> Path:
+        path = self.log_file()
+        return path.with_name(f"{path.name}.archive-manifest.json")
+
+    def _load_archive_manifest_unlocked(self) -> dict[str, Any]:
+        path = self._archive_manifest_file()
+        if not path.exists():
+            return empty_manifest()
+        try:
+            manifest = json.loads(path.read_bytes())
+            if not isinstance(manifest, dict) or manifest.get("schema") != "local_cold_archive_manifest_v1":
+                raise ValueError("Invalid operations archive manifest")
+            if not isinstance(manifest.get("batches"), list):
+                raise ValueError("Invalid operations archive batches")
+            if not isinstance(manifest.get("pending_records", {}), dict):
+                raise ValueError("Invalid operations pending cold records")
+            return manifest
+        except (ValueError, UnicodeError) as exc:
+            quarantine_file(path)
+            raise StorageCorruptionError("Operations archive manifest is damaged; writes are disabled.") from exc
+
+    def _recover_archive_transaction_unlocked(self) -> dict[str, Any]:
+        manifest = self._load_archive_manifest_unlocked()
+        pending = manifest.get("pending")
+        if pending is None:
+            return manifest
+        if not isinstance(pending, dict) or not isinstance(pending.get("retained_text"), str):
+            raise StorageCorruptionError("Operations archive transaction is damaged; writes are disabled.")
+        path = self.log_file()
+        current = path.read_bytes() if path.exists() else b""
+        checksum = sha256(current).hexdigest()
+        retained_text = pending["retained_text"]
+        if sha256(retained_text.encode("utf-8")).hexdigest() != pending.get("retained_sha256"):
+            raise StorageCorruptionError("Operations archive transaction checksum mismatch.")
+        if checksum == pending.get("source_sha256"):
+            write_text_atomic(path, retained_text)
+        elif checksum != pending.get("retained_sha256"):
+            raise StorageCorruptionError("Operations log changed during archive recovery; writes are disabled.")
+        committed = {key: value for key, value in manifest.items() if key != "pending"}
+        write_json_atomic(self._archive_manifest_file(), committed)
+        return committed
+
+    def storage_integrity(self) -> dict[str, Any]:
+        with self._lock, file_state_lock(self.log_file()):
+            manifest = self._load_archive_manifest_unlocked()
+            sources = manifest.get("invalid_sources", [])
+            invalid_count = sum(int(item.get("invalid_line_count") or 0) for item in sources)
+            return {
+                "status": "RECOVERY_PENDING" if manifest.get("pending") else "RECOVERED_WITH_ERRORS" if invalid_count else "OK",
+                "invalid_line_count": invalid_count,
+                "damaged_source_count": len(sources),
+                "evidence_files": [item["file"] for item in sources],
+                "archived_event_count": sum(int(item.get("record_count") or 0) for item in manifest["batches"]) + len(manifest.get("pending_records", {})),
+                "deletion_enabled": False,
+            }
 
     def redaction_policy(self) -> dict[str, Any]:
         return {
@@ -649,7 +722,7 @@ class OpsEventLog:
         }
 
     def clear(self) -> None:
-        with self._lock:
+        with self._lock, file_state_lock(self.log_file()):
             path = self.log_file()
             if path.exists():
                 path.unlink()
@@ -670,36 +743,49 @@ class OpsEventLog:
             "message": _safe_text(event.get("message"), 360),
             "context": _safe_dict(event.get("context")),
         }
-        with self._lock:
+        with self._lock, file_state_lock(self.log_file()):
             path = self.log_file()
             path.parent.mkdir(parents=True, exist_ok=True)
+            self._recover_archive_transaction_unlocked()
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n")
             self._trim_unlocked()
         return item
 
     def _read_events(self) -> list[dict[str, Any]]:
-        with self._lock:
+        with self._lock, file_state_lock(self.log_file()):
             self._trim_unlocked()
             return self._read_events_unlocked()
 
     def _read_events_unlocked(self) -> list[dict[str, Any]]:
-        return self._retained_events_unlocked(self._load_events_unlocked())
+        return self._load_events_unlocked()
+
+    def _read_history_events(self) -> list[dict[str, Any]]:
+        with self._lock, file_state_lock(self.log_file()):
+            self._trim_unlocked()
+            manifest = self._load_archive_manifest_unlocked()
+            cold = load_records(archive_dir(self.log_file(), "OPS_LOG_ARCHIVE_DIR"), manifest)
+            return [*cold.values(), *self._read_events_unlocked()]
 
     def _load_events_unlocked(self) -> list[dict[str, Any]]:
         path = self.log_file()
+        self._invalid_lines = []
+        self._loaded_bytes = b""
         if not path.exists():
             return []
         events: list[dict[str, Any]] = []
-        try:
-            for line in path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
+        self._loaded_bytes = path.read_bytes()
+        for number, line in enumerate(self._loaded_bytes.splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
                 parsed = json.loads(line)
-                if isinstance(parsed, dict):
-                    events.append(parsed)
-        except (OSError, json.JSONDecodeError):
-            return []
+                if not isinstance(parsed, dict):
+                    raise ValueError("Operations event must be an object")
+            except (ValueError, UnicodeError):
+                self._invalid_lines.append(number)
+                continue
+            events.append(parsed)
         return events
 
     def _retained_events_unlocked(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -710,7 +796,9 @@ class OpsEventLog:
                 event for event in events
                 if self._event_is_within_retention(event, cutoff=cutoff)
             ]
-        return events[-self._max_events :]
+        if len(events) > self._max_events:
+            return events[-max(1, self._max_events * 3 // 4):]
+        return events
 
     def _event_is_within_retention(self, event: dict[str, Any], *, cutoff: datetime) -> bool:
         event_time = _parse_timestamp(event.get("created_at"))
@@ -719,17 +807,37 @@ class OpsEventLog:
         return event_time >= cutoff
 
     def _trim_unlocked(self) -> None:
+        manifest = self._recover_archive_transaction_unlocked()
         path = self.log_file()
         if not path.exists():
             return
         events = self._load_events_unlocked()
         retained = self._retained_events_unlocked(events)
-        if retained == events:
+        if retained == events and not self._invalid_lines:
             return
-        path.write_text(
-            "".join(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n" for event in retained),
-            encoding="utf-8",
+        retained_ids = {id(event) for event in retained}
+        moved = [event for event in events if id(event) not in retained_ids]
+        new_manifest = append_batch(
+            archive_dir(path, "OPS_LOG_ARCHIVE_DIR"), manifest,
+            {f"{len(manifest['batches']):08d}:{len(manifest.get('pending_records', {})) + index:012d}": event for index, event in enumerate(moved)},
         )
+        if self._invalid_lines:
+            evidence = {**quarantine_file(path, self._loaded_bytes), "invalid_line_count": len(self._invalid_lines), "line_numbers": self._invalid_lines}
+            sources = list(manifest.get("invalid_sources", []))
+            if not any(item.get("sha256") == evidence["sha256"] for item in sources):
+                sources.append(evidence)
+            new_manifest["invalid_sources"] = sources
+        retained_text = "".join(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n" for event in retained)
+        pending = {
+            "source_sha256": sha256(self._loaded_bytes).hexdigest(),
+            "retained_sha256": sha256(retained_text.encode("utf-8")).hexdigest(),
+            "retained_text": retained_text,
+        }
+        # Publish recoverable intent before replacing the hot file. Either old
+        # bytes or all archived records remain available at every failure point.
+        write_json_atomic(self._archive_manifest_file(), {**new_manifest, "pending": pending})
+        write_text_atomic(path, retained_text)
+        write_json_atomic(self._archive_manifest_file(), new_manifest)
 
     def _event_search_text(self, event: dict[str, Any]) -> str:
         fields = [
@@ -748,9 +856,7 @@ class OpsEventLog:
         return json.dumps(fields, ensure_ascii=False, sort_keys=True, default=str).lower()
 
     def _write_json_atomic(self, path: Path, payload: dict[str, Any]) -> None:
-        temp_path = path.with_suffix(f"{path.suffix}.tmp")
-        temp_path.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-        temp_path.replace(path)
+        write_json_atomic(path, payload)
 
 
 ops_event_log = OpsEventLog()

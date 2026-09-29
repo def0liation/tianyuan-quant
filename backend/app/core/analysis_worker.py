@@ -32,31 +32,32 @@ async def _record_heartbeat_until_done(
     worker_id: str,
     operator: str,
     interval_seconds: float | None = None,
+    expected_job_id: str | None = None,
 ) -> None:
     interval = interval_seconds if interval_seconds is not None else _heartbeat_interval_seconds()
     while True:
-        latest_job = await asyncio.to_thread(analysis_job_store.get_job, run_id)
-        if str((latest_job or {}).get("status") or "").upper() in {"CANCEL_REQUESTED", "CANCELLED"}:
-            run = analysis_lifecycle_service.peek_run(run_id) or analysis_lifecycle_service.get_run(run_id)
-            if isinstance(run, dict):
-                run["cancelRequested"] = True
-                run["job"] = latest_job
-                run["updatedAt"] = datetime.now().isoformat()
-                analysis_lifecycle_service.set_run(run_id, run, persist=True)
-            await asyncio.sleep(interval)
-            continue
-
         heartbeat_job = await asyncio.to_thread(
             analysis_job_store.record_worker_heartbeat,
             run_id,
             worker_id=worker_id,
             operator=operator,
             metrics={"heartbeat_at": datetime.now().isoformat()},
+            expected_job_id=expected_job_id,
         )
-        run = analysis_lifecycle_service.peek_run(run_id)
+        if heartbeat_job.get("lease_update_rejected") or heartbeat_job.get("state_update_rejected"):
+            return
+        status = str(heartbeat_job.get("status") or "").upper()
+        if status in analysis_job_store.TERMINAL_JOB_STATUSES and status != "CANCELLED":
+            return
+        run = analysis_lifecycle_service.peek_run(run_id) or analysis_lifecycle_service.get_run(run_id)
         if isinstance(run, dict):
             run["job"] = heartbeat_job
-            analysis_lifecycle_service.set_run(run_id, run)
+            if status in {"CANCEL_REQUESTED", "CANCELLED"}:
+                run["cancelRequested"] = True
+                run["updatedAt"] = datetime.now().isoformat()
+            analysis_lifecycle_service.set_run(run_id, run, persist=status == "CANCEL_REQUESTED")
+        if status == "CANCELLED":
+            return
         await asyncio.sleep(interval)
 
 
@@ -71,6 +72,7 @@ async def run_worker_once(*, worker_id: str | None = None, operator: str = "anal
         return {"claimed": False, "worker_id": resolved_worker_id}
 
     run_id = str(job.get("run_id") or "")
+    claimed_job_id = str(job.get("job_id") or "")
 
     run = analysis_lifecycle_service.get_run(run_id)
     if not isinstance(run, dict):
@@ -79,17 +81,32 @@ async def run_worker_once(*, worker_id: str | None = None, operator: str = "anal
             "Queued run was not found before worker execution.",
             operator=operator,
             worker_id=resolved_worker_id,
+            expected_job_id=claimed_job_id,
         )
-        return {"claimed": True, "worker_id": resolved_worker_id, "run_id": run_id, "status": "FAILED", "job": failed_job}
+        return {"claimed": True, "worker_id": resolved_worker_id, "run_id": run_id, "status": failed_job.get("status", "FAILED"), "job": failed_job}
+
+    payload_job_id = str((run.get("job") or {}).get("job_id") or "")
+    if payload_job_id and payload_job_id != claimed_job_id:
+        failed_job = analysis_job_store.mark_failed(
+            run_id,
+            "Queued run payload does not match the claimed job epoch.",
+            operator=operator,
+            worker_id=resolved_worker_id,
+            expected_job_id=claimed_job_id,
+        )
+        return {"claimed": True, "worker_id": resolved_worker_id, "run_id": run_id, "status": failed_job.get("status"), "job": failed_job}
 
     if run.get("cancelRequested"):
-        analysis_lifecycle_service.mark_run_cancelled(run_id, run, "Analysis run cancelled before worker execution.")
         cancelled_job = analysis_job_store.mark_cancelled(
             run_id,
             "cancelled_before_execution",
             operator=operator,
             worker_id=resolved_worker_id,
+            expected_job_id=claimed_job_id,
         )
+        if cancelled_job.get("lease_update_rejected") or cancelled_job.get("state_update_rejected"):
+            return {"claimed": True, "worker_id": resolved_worker_id, "run_id": run_id, "status": cancelled_job.get("status"), "job": cancelled_job}
+        analysis_lifecycle_service.mark_run_cancelled(run_id, run, "Analysis run cancelled before worker execution.")
         run["job"] = cancelled_job
         analysis_lifecycle_service.set_run(run_id, run, persist=True)
         return {"claimed": True, "worker_id": resolved_worker_id, "run_id": run_id, "status": "CANCELLED", "job": cancelled_job}
@@ -99,7 +116,10 @@ async def run_worker_once(*, worker_id: str | None = None, operator: str = "anal
         worker_id=resolved_worker_id,
         operator=operator,
         metrics={"claimed_at": datetime.now().isoformat()},
+        expected_job_id=claimed_job_id,
     )
+    if heartbeat_job.get("lease_update_rejected") or heartbeat_job.get("state_update_rejected") or heartbeat_job.get("status") in analysis_job_store.TERMINAL_JOB_STATUSES:
+        return {"claimed": True, "worker_id": resolved_worker_id, "run_id": run_id, "status": heartbeat_job.get("status"), "job": heartbeat_job}
     run["status"] = "RUNNING"
     run["job"] = heartbeat_job
     run["updatedAt"] = datetime.now().isoformat()
@@ -110,10 +130,11 @@ async def run_worker_once(*, worker_id: str | None = None, operator: str = "anal
             run_id,
             worker_id=resolved_worker_id,
             operator=operator,
+            expected_job_id=claimed_job_id,
         )
     )
     try:
-        await analysis_lifecycle_service.execute_and_persist_run(run_id, worker_id=resolved_worker_id)
+        await analysis_lifecycle_service.execute_and_persist_run(run_id, worker_id=resolved_worker_id, expected_job_id=claimed_job_id)
     finally:
         heartbeat_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -125,7 +146,7 @@ async def run_worker_once(*, worker_id: str | None = None, operator: str = "anal
         "claimed": True,
         "worker_id": resolved_worker_id,
         "run_id": run_id,
-        "status": final_run.get("status") or (final_job or {}).get("status"),
+        "status": (final_job or {}).get("status") or final_run.get("status"),
         "job": final_job,
     }
 
@@ -154,9 +175,9 @@ def main() -> None:
     parser.add_argument("--worker-id", default="", help="Stable worker id for heartbeat/job history.")
     args = parser.parse_args()
 
-    # Importing the app registers API-owned analysis lifecycle callbacks with
-    # the core lifecycle facade before the standalone worker loop starts.
-    from .. import main as _app_main  # noqa: F401
+    # Register the lifecycle callbacks without initializing the HTTP app and
+    # its unrelated routes/startup services in this independent process.
+    analysis_lifecycle_service.initialize_analysis_lifecycle()
 
     asyncio.run(
         run_worker_loop(

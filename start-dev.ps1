@@ -175,7 +175,7 @@ function Resolve-PythonForVenv {
         }
     }
 
-    throw "Python was not found. Install Python 3.11+, install uv, or create backend\.venv manually."
+    throw "Python was not found. Install Python 3.13, install uv, or create backend\.venv manually."
 }
 
 function Resolve-FallbackPython {
@@ -323,7 +323,7 @@ function Ensure-Backend {
                     "--python",
                     $fallbackPython,
                     "--with-requirements",
-                    "requirements.txt",
+                    "requirements.lock",
                     "python"
                 )
             }
@@ -350,7 +350,7 @@ function Ensure-Backend {
 
     if ($Install) {
         Write-Step "Installing backend dependencies"
-        Invoke-Checked -FilePath $BackendPython -Arguments @("-m", "pip", "install", "-r", "requirements.txt") -WorkingDirectory $BackendDir
+        Invoke-Checked -FilePath $BackendPython -Arguments @("-m", "pip", "install", "--require-hashes", "-r", "requirements.lock") -WorkingDirectory $BackendDir
     }
 
     return @{ File = $BackendPython; Args = @() }
