@@ -560,8 +560,8 @@ def _call_tushare_realtime_quote_sina_sync(
 def _call_tushare_http_api_sync(
     profile: MarketDataProfile, api_name: str, params: Dict[str, Any]
 ) -> Dict[str, Any]:
-    assert_market_data_egress_allowed(profile)
     endpoint = profile.base_url or TUSHARE_HTTP_ENDPOINT
+    assert_market_data_egress_allowed(profile, endpoint=endpoint)
     body = {
         "api_name": api_name,
         "token": profile.api_key,

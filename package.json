@@ -37,6 +37,8 @@
     "worker:analysis": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\analysis-worker.ps1",
     "test": "npm.cmd run test:backend",
     "test:frontend": "npm.cmd --prefix frontend run typecheck",
+    "test:preview-security": "node --test scripts/test-preview-dist.cjs",
+    "test:session-persistence": "node --test scripts/test-session-persistence.cjs",
     "test:backend": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\test-backend.ps1",
     "test:backend:all": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\test-backend.ps1 -All"
   },

@@ -1,13 +1,16 @@
+import copy
 import json
 import logging
 import os
 import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from .file_utils import write_json_atomic
+from .file_utils import file_state_lock, write_json_atomic
+from .cold_archive import StorageCorruptionError, quarantine_file
 from ..db.session import DATABASE_URL, DB_PATH
 
 
@@ -61,24 +64,71 @@ SQLITE_DB_FILE = _sqlite_path_from_database_url(DATABASE_URL)
 DEFAULT_SQLITE_TIMEOUT_SECONDS = 0.25
 
 
+def job_state_lock():
+    """Serialize JSON/SQLite lifecycle changes across threads and processes."""
+    return file_state_lock(STORAGE_FILE)
+
+
+def _serialized_job_state(function):
+    @wraps(function)
+    def locked(*args, **kwargs):
+        with job_state_lock():
+            return function(*args, **kwargs)
+    return locked
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _load_state() -> Dict[str, Any]:
-    if not STORAGE_FILE.exists():
-        return {"version": 1, "jobs": {}, "updated_at": _now()}
+def _valid_job_state(state: Any) -> bool:
+    return (
+        isinstance(state, dict)
+        and type(state.get("version", 1)) is int
+        and state.get("version", 1) == 1
+        and isinstance(state.get("jobs"), dict)
+    )
+
+
+def _readonly_job_state(raw: bytes | None) -> Dict[str, Any]:
+    state = {"version": 1, "jobs": {}, "updated_at": _now(), "warning": "job_store_recovered"}
     try:
-        with STORAGE_FILE.open("r", encoding="utf-8") as file:
-            state = json.load(file)
-    except (json.JSONDecodeError, OSError):
-        return {"version": 1, "jobs": {}, "updated_at": _now(), "warning": "job_store_recovered"}
-    state.setdefault("version", 1)
-    state.setdefault("jobs", {})
+        state["quarantine"] = quarantine_file(STORAGE_FILE, raw)
+    except OSError:
+        state["quarantine_unavailable"] = True
     return state
 
 
+def _load_state() -> Dict[str, Any]:
+    raw = None
+    try:
+        raw = STORAGE_FILE.read_bytes()
+        state = json.loads(raw.decode("utf-8"))
+    except FileNotFoundError:
+        try:
+            STORAGE_FILE.stat()
+        except FileNotFoundError:
+            return {"version": 1, "jobs": {}, "updated_at": _now()}
+        except OSError:
+            pass
+        return _readonly_job_state(raw)
+    except (ValueError, OSError):
+        return _readonly_job_state(raw)
+    if not _valid_job_state(state) or state.get("warning"):
+        return _readonly_job_state(raw)
+    state.setdefault("version", 1)
+    return state
+
+
+def _assert_writable_job_state(state: Dict[str, Any]) -> None:
+    if not _valid_job_state(state) or state.get("warning"):
+        raise StorageCorruptionError("Analysis job storage is read-only; the original state requires review.")
+
+
+@_serialized_job_state
 def _save_state(state: Dict[str, Any]) -> None:
+    _assert_writable_job_state(state)
+    _assert_writable_job_state(_load_state())
     state["updated_at"] = _now()
     write_json_atomic(STORAGE_FILE, state)
 
@@ -646,8 +696,15 @@ def _reject_if_worker_mismatch(
     worker_id: str | None,
     actor: str,
     event: str,
+    expected_job_id: str | None = None,
 ) -> Dict[str, Any] | None:
     attempted_worker_id = str(worker_id or "").strip()
+    if expected_job_id and str(job.get("job_id") or "") != expected_job_id:
+        rejected = _lease_rejection(job, attempted_worker_id=attempted_worker_id, actor=actor, event=event)
+        rejected["lease_rejection_reason"] = "JOB_EPOCH_MISMATCH"
+        rejected["state_update_rejected"] = True
+        rejected["expected_job_id"] = expected_job_id
+        return rejected
     if not attempted_worker_id:
         return None
     status = str(job.get("status") or "").upper()
@@ -667,6 +724,20 @@ def _reject_if_worker_mismatch(
 def _json_job_is_newer_or_equal(json_job: Dict[str, Any], sqlite_job: Dict[str, Any] | None) -> bool:
     if sqlite_job is None:
         return True
+    json_attempt = _as_int(json_job.get("attempt"))
+    sqlite_attempt = _as_int(sqlite_job.get("attempt"))
+    if json_attempt != sqlite_attempt:
+        return json_attempt > sqlite_attempt
+    json_status = str(json_job.get("status") or "PENDING").upper()
+    sqlite_status = str(sqlite_job.get("status") or "PENDING").upper()
+    if sqlite_status in TERMINAL_JOB_STATUSES and json_status != sqlite_status:
+        return False
+    if json_status in TERMINAL_JOB_STATUSES and sqlite_status not in TERMINAL_JOB_STATUSES:
+        return True
+    if sqlite_status == "CANCEL_REQUESTED" and json_status in {"PENDING", "QUEUED", "RUNNING"}:
+        return False
+    if json_status == "CANCEL_REQUESTED" and sqlite_status in {"PENDING", "QUEUED", "RUNNING"}:
+        return True
     json_activity = _job_activity_at(json_job)
     sqlite_activity = _job_activity_at(sqlite_job)
     if json_activity is None:
@@ -676,7 +747,16 @@ def _json_job_is_newer_or_equal(json_job: Dict[str, Any], sqlite_job: Dict[str, 
     return json_activity >= sqlite_activity
 
 
-def upsert_sqlite_job(job: Dict[str, Any]) -> Dict[str, Any]:
+def _job_revision(job: Dict[str, Any]) -> tuple:
+    return tuple(job.get(key) for key in (
+        "job_id", "attempt", "status", "updated_at", "worker_id",
+        "worker_heartbeat_at", "cancel_requested_at",
+    ))
+
+
+@_serialized_job_state
+def upsert_sqlite_job(job: Dict[str, Any], *, expected_job: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    _assert_writable_job_state(_load_state())
     normalized = _normalize_job(job)
     _ensure_sqlite_table()
     payload = dict(normalized)
@@ -717,6 +797,14 @@ def upsert_sqlite_job(job: Dict[str, Any]) -> Dict[str, Any]:
     update_columns = [key for key in params if key != "run_id"]
     assignments = ", ".join(f"{key}=excluded.{key}" for key in update_columns)
     with _sqlite_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM analysis_jobs WHERE run_id = ?", (normalized["run_id"],)).fetchone()
+        current = _row_to_job(row) if row else None
+        if current is not None:
+            if expected_job is not None and _job_revision(current) != _job_revision(_normalize_job(expected_job)):
+                return {**current, "state_update_rejected": True}
+            if not _json_job_is_newer_or_equal(normalized, current):
+                return current
         conn.execute(
             f"""
             INSERT INTO analysis_jobs (
@@ -805,6 +893,8 @@ def _upsert_attempt_with_conn(conn: sqlite3.Connection, job: Dict[str, Any]) -> 
 
 
 def _mirror_job_to_sqlite(job: Dict[str, Any]) -> None:
+    if _sqlite_file() is None:
+        return
     try:
         upsert_sqlite_job(job)
     except (OSError, sqlite3.Error, ValueError) as exc:
@@ -815,6 +905,8 @@ def _mirror_job_to_sqlite(job: Dict[str, Any]) -> None:
 
 
 def _mirror_state_to_sqlite(state: Dict[str, Any]) -> None:
+    if state.get("warning"):
+        return
     jobs = state.get("jobs", {})
     if not isinstance(jobs, dict):
         return
@@ -1022,6 +1114,7 @@ def list_json_attempts(
     return attempts[offset:offset + limit]
 
 
+@_serialized_job_state
 def claim_next_job(
     *,
     queue_name: str = DEFAULT_QUEUE_NAME,
@@ -1031,6 +1124,7 @@ def claim_next_job(
     if _sqlite_file() is None:
         return None
     state = _load_state()
+    _assert_writable_job_state(state)
     _mirror_state_to_sqlite(state)
     _ensure_sqlite_table()
 
@@ -1061,7 +1155,7 @@ def claim_next_job(
                         SELECT COUNT(*) FROM analysis_jobs
                         WHERE queue_name = ?
                           AND concurrency_group = ?
-                          AND status = 'RUNNING'
+                          AND status IN ('RUNNING', 'CANCEL_REQUESTED')
                           AND run_id != ?
                         """,
                         (
@@ -1142,26 +1236,39 @@ def claim_next_job(
     return _persist_job_state(state, claimed["run_id"], claimed)
 
 
-def _persist_job_state(state: Dict[str, Any], run_id: str, job: Dict[str, Any]) -> Dict[str, Any]:
+@_serialized_job_state
+def _persist_job_state(
+    state: Dict[str, Any], run_id: str, job: Dict[str, Any],
+    *, expected_job: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    _assert_writable_job_state(state)
     normalized = _normalize_job(job)
-    state["jobs"][run_id] = normalized
-    _save_state(state)
-    _mirror_job_to_sqlite(normalized)
+    latest_state = _load_state()
+    _assert_writable_job_state(latest_state)
+    current_json = latest_state.get("jobs", {}).get(run_id)
+    if isinstance(current_json, dict) and not _json_job_is_newer_or_equal(normalized, current_json):
+        normalized = _normalize_job(current_json)
+    if _sqlite_file() is not None:
+        normalized = upsert_sqlite_job(normalized, expected_job=expected_job)
+    durable_job = {key: value for key, value in normalized.items() if key != "state_update_rejected"}
+    latest_state["jobs"][run_id] = durable_job
+    _save_state(latest_state)
     return normalized
 
 
 def _existing_job(state: Dict[str, Any], run_id: str) -> Dict[str, Any] | None:
     job = state.get("jobs", {}).get(run_id)
-    if isinstance(job, dict):
-        return job
     try:
-        return get_sqlite_job(run_id)
+        sqlite_job = get_sqlite_job(run_id)
+        if isinstance(job, dict) and _json_job_is_newer_or_equal(job, sqlite_job):
+            return job
+        return sqlite_job or job
     except (OSError, sqlite3.Error) as exc:
         if _is_sqlite_locked(exc):
             logger.warning("Skipped loading existing analysis job %s from locked SQLite mirror.", run_id)
-            return None
+            raise
         logger.exception("Failed to load existing analysis job %s from SQLite.", run_id)
-    return None
+    return job if isinstance(job, dict) else None
 
 
 def _parse_timestamp(value: Any) -> Optional[datetime]:
@@ -1224,6 +1331,7 @@ def _base_job(run_id: str) -> Dict[str, Any]:
     }
 
 
+@_serialized_job_state
 def get_job(run_id: str) -> Optional[Dict[str, Any]]:
     state = _load_state()
     json_job = state.get("jobs", {}).get(run_id)
@@ -1321,6 +1429,7 @@ def summarize_jobs(limit: int = 100, offset: int = 0, statuses: Iterable[str] | 
     }
 
 
+@_serialized_job_state
 def reconcile_stale_jobs(
     *,
     stale_after_seconds: int,
@@ -1329,6 +1438,8 @@ def reconcile_stale_jobs(
     operator: str | None = None,
 ) -> List[Dict[str, Any]]:
     state = _load_state()
+    if state.get("warning"):
+        return []
     jobs = state.get("jobs", {})
     if not isinstance(jobs, dict):
         return []
@@ -1353,16 +1464,20 @@ def reconcile_stale_jobs(
     recovered: List[Dict[str, Any]] = []
 
     for run_id, existing in list(jobs.items()):
+        existing = _existing_job(state, run_id) or existing
         if run_id in active_run_ids or not isinstance(existing, dict):
             continue
         status_before = str(existing.get("status") or "PENDING")
         if status_before not in STALE_RECOVERABLE_JOB_STATUSES:
             continue
+        lease_expires_at = _parse_timestamp(existing.get("lease_expires_at"))
+        if status_before in LEASE_PROTECTED_JOB_STATUSES and lease_expires_at is not None and now < lease_expires_at:
+            continue
         last_activity = _job_activity_at(existing)
         if last_activity is not None and (now - last_activity).total_seconds() < stale_after_seconds:
             continue
 
-        job = dict(existing)
+        job = copy.deepcopy(existing)
         recovered_at = _now()
         last_activity_text = existing.get("updated_at") or existing.get("started_at") or existing.get("created_at") or ""
         reason = (
@@ -1398,14 +1513,9 @@ def reconcile_stale_jobs(
                 "status_before": status_before,
             }
         )
-        jobs[run_id] = job
-        recovered.append(job)
-
-    if recovered:
-        state["jobs"] = jobs
-        _save_state(state)
-        for job in recovered:
-            _mirror_job_to_sqlite(job)
+        persisted = _persist_job_state(state, run_id, job, expected_job=existing)
+        if persisted.get("status") == "STALE" and not persisted.get("state_update_rejected"):
+            recovered.append(persisted)
     return recovered
 
 
@@ -1414,10 +1524,13 @@ def _clean_operator(operator: str | None) -> str:
     return value[:80] if value else DEFAULT_OPERATOR
 
 
+@_serialized_job_state
 def start_job(run_id: str, *, retry_from_node_id: str = "", operator: str | None = None) -> Dict[str, Any]:
     state = _load_state()
-    job = dict(_existing_job(state, run_id) or _base_job(run_id))
-    if job.get("status") not in TERMINAL_JOB_STATUSES and job.get("status") in {"RUNNING", "QUEUED"}:
+    _assert_writable_job_state(state)
+    previous_job = _existing_job(state, run_id)
+    job = copy.deepcopy(previous_job or _base_job(run_id))
+    if job.get("status") in {"RUNNING", "QUEUED", "CANCEL_REQUESTED"}:
         _mirror_job_to_sqlite(job)
         return job
     actor = _clean_operator(operator)
@@ -1451,10 +1564,13 @@ def start_job(run_id: str, *, retry_from_node_id: str = "", operator: str | None
             "operator": actor,
         }
     )
-    return _persist_job_state(state, run_id, job)
+    return _persist_job_state(state, run_id, job, expected_job=previous_job)
 
 
-def mark_running(run_id: str, *, operator: str | None = None, worker_id: str | None = None) -> Dict[str, Any]:
+def mark_running(
+    run_id: str, *, operator: str | None = None, worker_id: str | None = None,
+    expected_job_id: str | None = None,
+) -> Dict[str, Any]:
     started_at = _now()
     resolved_worker_id = str(worker_id or DEFAULT_WORKER_ID)
     return _update_job(
@@ -1465,6 +1581,7 @@ def mark_running(run_id: str, *, operator: str | None = None, worker_id: str | N
         worker_id=resolved_worker_id,
         worker_heartbeat_at=started_at,
         lease_worker_id=resolved_worker_id,
+        expected_job_id=expected_job_id,
     )
 
 
@@ -1478,6 +1595,7 @@ def mark_cancelled(
     *,
     operator: str | None = None,
     worker_id: str | None = None,
+    expected_job_id: str | None = None,
 ) -> Dict[str, Any]:
     finished_at = _now()
     return _update_job(
@@ -1488,10 +1606,14 @@ def mark_cancelled(
         worker_heartbeat_at=finished_at,
         last_error=reason,
         lease_worker_id=worker_id,
+        expected_job_id=expected_job_id,
     )
 
 
-def mark_completed(run_id: str, *, operator: str | None = None, worker_id: str | None = None) -> Dict[str, Any]:
+def mark_completed(
+    run_id: str, *, operator: str | None = None, worker_id: str | None = None,
+    expected_job_id: str | None = None,
+) -> Dict[str, Any]:
     finished_at = _now()
     return _update_job(
         run_id,
@@ -1501,6 +1623,7 @@ def mark_completed(run_id: str, *, operator: str | None = None, worker_id: str |
         worker_heartbeat_at=finished_at,
         last_error="",
         lease_worker_id=worker_id,
+        expected_job_id=expected_job_id,
     )
 
 
@@ -1511,6 +1634,7 @@ def mark_failed(
     *,
     operator: str | None = None,
     worker_id: str | None = None,
+    expected_job_id: str | None = None,
 ) -> Dict[str, Any]:
     finished_at = _now()
     return _update_job(
@@ -1522,6 +1646,7 @@ def mark_failed(
         last_error=error,
         failed_node_id=failed_node_id,
         lease_worker_id=worker_id,
+        expected_job_id=expected_job_id,
     )
 
 
@@ -1539,29 +1664,35 @@ def mark_stale(run_id: str, reason: str, failed_node_id: str = "", *, operator: 
     )
 
 
+@_serialized_job_state
 def record_worker_heartbeat(
     run_id: str,
     *,
     worker_id: str | None = None,
     operator: str | None = None,
     metrics: Dict[str, Any] | None = None,
+    expected_job_id: str | None = None,
 ) -> Dict[str, Any]:
     state = _load_state()
-    job = dict(_existing_job(state, run_id) or _base_job(run_id))
-    if job.get("status") in TERMINAL_JOB_STATUSES:
-        _mirror_job_to_sqlite(job)
-        return job
+    _assert_writable_job_state(state)
+    previous_job = _existing_job(state, run_id)
+    job = copy.deepcopy(previous_job or _base_job(run_id))
     actor = _clean_operator(operator or job.get("last_operator") or job.get("operator"))
     rejected = _reject_if_worker_mismatch(
         job,
         worker_id=worker_id,
         actor=actor,
         event="WORKER_HEARTBEAT",
+        expected_job_id=expected_job_id,
     )
     if rejected is not None:
         return rejected
+    if job.get("status") in TERMINAL_JOB_STATUSES:
+        _mirror_job_to_sqlite(job)
+        return job
     heartbeat_at = _now()
-    job["status"] = "RUNNING"
+    if job.get("status") != "CANCEL_REQUESTED":
+        job["status"] = "RUNNING"
     job["updated_at"] = heartbeat_at
     job["worker_id"] = str(worker_id or job.get("worker_id") or DEFAULT_WORKER_ID)
     job["worker_heartbeat_at"] = heartbeat_at
@@ -1577,23 +1708,32 @@ def record_worker_heartbeat(
             "metrics": metrics or {},
         }
     )
-    return _persist_job_state(state, run_id, job)
+    return _persist_job_state(state, run_id, job, expected_job=previous_job)
 
 
+@_serialized_job_state
 def _update_job(run_id: str, status: str, operator: str | None = None, **updates: Any) -> Dict[str, Any]:
     state = _load_state()
-    job = dict(_existing_job(state, run_id) or _base_job(run_id))
+    _assert_writable_job_state(state)
+    previous_job = _existing_job(state, run_id)
+    job = copy.deepcopy(previous_job or _base_job(run_id))
     actor = _clean_operator(operator or job.get("last_operator") or job.get("operator"))
     lease_worker_id = updates.pop("lease_worker_id", None)
+    expected_job_id = updates.pop("expected_job_id", None)
     rejected = _reject_if_worker_mismatch(
         job,
         worker_id=lease_worker_id,
         actor=actor,
         event=f"JOB_{status}",
+        expected_job_id=expected_job_id,
     )
     if rejected is not None:
         return rejected
     status_before = str(job.get("status") or "PENDING")
+    if status_before in TERMINAL_JOB_STATUSES:
+        return job if status == status_before else {**job, "state_update_rejected": True}
+    if status_before == "CANCEL_REQUESTED" and status in {"PENDING", "QUEUED", "RUNNING", "COMPLETED"}:
+        return {**job, "state_update_rejected": True}
     job["status"] = status
     job["updated_at"] = _now()
     job["last_operator"] = actor
@@ -1613,4 +1753,4 @@ def _update_job(run_id: str, status: str, operator: str | None = None, **updates
             "worker_heartbeat_at": job.get("worker_heartbeat_at", ""),
         }
     )
-    return _persist_job_state(state, run_id, job)
+    return _persist_job_state(state, run_id, job, expected_job=previous_job)

@@ -468,11 +468,12 @@ def _market_data_profile_cache_fingerprint(profile: MarketDataProfile) -> str:
 
 
 def _call_market_data_profile(profile: MarketDataProfile, symbol: str) -> Any:
-    assert_market_data_egress_allowed(profile)
     if profile.provider.lower() == TUSHARE_PROVIDER:
+        assert_market_data_egress_allowed(profile)
         return _call_tushare_profile(profile, symbol)
 
     endpoint = _market_data_endpoint(profile, symbol)
+    assert_market_data_egress_allowed(profile, endpoint=endpoint)
     headers = {
         "Accept": "application/json",
         **profile.extra_headers,
@@ -634,12 +635,12 @@ def _sina_realtime_record(ts_code: str, values: list[str]) -> Dict[str, Any]:
 
 
 def _call_tushare_http_api(profile: MarketDataProfile, symbol: str, api_name: str) -> Dict[str, Any]:
-    assert_market_data_egress_allowed(profile)
     endpoint = profile.base_url or TUSHARE_HTTP_ENDPOINT
     if profile.quote_path.startswith("http://") or profile.quote_path.startswith("https://"):
         endpoint = profile.quote_path
     elif profile.quote_path:
         endpoint = f"{endpoint.rstrip('/')}/{profile.quote_path.lstrip('/')}"
+    assert_market_data_egress_allowed(profile, endpoint=endpoint)
 
     body = {
         "api_name": api_name,
@@ -1146,8 +1147,8 @@ def _call_tushare_http_api_raw(
     api_name: str,
     params: Dict[str, Any],
 ) -> Dict[str, Any]:
-    assert_market_data_egress_allowed(profile)
     endpoint = profile.base_url or TUSHARE_HTTP_ENDPOINT
+    assert_market_data_egress_allowed(profile, endpoint=endpoint)
     body = {
         "api_name": api_name,
         "token": profile.api_key,

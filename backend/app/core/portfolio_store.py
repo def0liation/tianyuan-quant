@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import uuid
+from zipfile import BadZipFile, ZipFile
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Tuple
 
@@ -44,6 +45,8 @@ MAX_IMPORT_BYTES = 2 * 1024 * 1024
 MAX_IMPORT_ROWS = 5_000
 MAX_IMPORT_COLUMNS = 64
 MAX_IMPORT_CELL_CHARS = 2_000
+MAX_XLSX_EXPANDED_BYTES = 32 * 1024 * 1024
+MAX_XLSX_ZIP_ENTRIES = 128
 
 
 BROKER_SOURCE_HINTS = {
@@ -384,6 +387,17 @@ def decode_table(raw: bytes, filename: str) -> Tuple[List[Dict[str, Any]], str]:
 
 
 def _decode_xlsx(raw: bytes) -> List[Dict[str, Any]]:
+    # Shared strings and workbook metadata load before row iteration limits.
+    try:
+        with ZipFile(io.BytesIO(raw)) as archive:
+            entries = archive.infolist()
+            if len(entries) > MAX_XLSX_ZIP_ENTRIES:
+                raise ValueError(f"XLSX archive exceeds the {MAX_XLSX_ZIP_ENTRIES} entry limit.")
+            if sum(entry.file_size for entry in entries) > MAX_XLSX_EXPANDED_BYTES:
+                raise ValueError(f"XLSX archive exceeds the {MAX_XLSX_EXPANDED_BYTES} expanded byte limit.")
+    except BadZipFile as exc:
+        raise ValueError("Invalid XLSX archive. Please export a valid workbook or CSV.") from exc
+
     try:
         from openpyxl import load_workbook
     except ImportError as exc:

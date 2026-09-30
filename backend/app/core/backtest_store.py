@@ -6,6 +6,7 @@ import os
 import random
 import re
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -28,7 +29,11 @@ from ..core.bottom_research import (
     stable_payload_hash,
 )
 from ..models.backtest import BacktestReport, BacktestComparison
-from ..core.file_utils import write_json_atomic
+from ..core.file_utils import file_state_lock, write_json_atomic
+from ..core.cold_archive import (
+    StorageCorruptionError, append_batch, archive_dir, hot_limit, load_records,
+    quarantine_file, split_hot_records,
+)
 from ..core.agent_runtime_store import get_default_market_data_profile
 from ..core.market_data_runner import (
     _call_tushare_http_api_raw,
@@ -1565,38 +1570,69 @@ class BacktestStore:
         self._random_validation_jobs: Dict[str, Dict[str, Any]] = {}
         self._random_validation_tasks: Dict[str, asyncio.Task] = {}
         self._random_validation_lock = asyncio.Lock()
-        restored_parameter_jobs, restored_changed = self._load_parameter_scan_jobs()
-        self._parameter_scan_jobs: Dict[str, Dict[str, Any]] = restored_parameter_jobs
+        self._parameter_scan_store_error: Optional[str] = None
+        self._parameter_scan_archive_manifest: Optional[Dict[str, Any]] = None
+        self._parameter_scan_cold_jobs: Dict[str, Dict[str, Any]] = {}
         self._parameter_scan_tasks: Dict[str, asyncio.Task] = {}
         self._parameter_scan_jobs_lock = asyncio.Lock()
         self._fingerprint_locks: Dict[str, asyncio.Lock] = {}
         self._fingerprint_locks_guard = asyncio.Lock()
-        if restored_changed:
-            self._save_parameter_scan_jobs_snapshot(dict(self._parameter_scan_jobs))
+        with file_state_lock(PARAMETER_SCAN_JOB_STORE_FILE):
+            restored_parameter_jobs, restored_changed = self._load_parameter_scan_jobs()
+            self._parameter_scan_jobs: Dict[str, Dict[str, Any]] = restored_parameter_jobs
+            self._parameter_scan_last_saved_jobs = json.loads(json.dumps(restored_parameter_jobs, default=str))
+            if restored_changed:
+                self._save_parameter_scan_jobs_snapshot(dict(self._parameter_scan_jobs))
 
-    def _load_parameter_scan_jobs(self) -> Tuple[Dict[str, Dict[str, Any]], bool]:
+    def _load_parameter_scan_jobs(self, *, recover_interrupted: bool = True) -> Tuple[Dict[str, Dict[str, Any]], bool]:
         store_file = PARAMETER_SCAN_JOB_STORE_FILE
         if not store_file.exists():
             return {}, False
         try:
             with store_file.open("r", encoding="utf-8") as file:
                 state = json.load(file)
-        except (json.JSONDecodeError, OSError):
+        except (ValueError, OSError) as exc:
+            if isinstance(exc, (ValueError, UnicodeError)):
+                quarantine_file(store_file)
+            self._parameter_scan_store_error = "Backtest parameter scan state cannot be loaded; writes are disabled."
             logger.exception("Backtest parameter scan job store could not be loaded")
             return {}, False
-        raw_jobs = state.get("jobs") if isinstance(state, dict) else {}
+        raw_jobs = state.get("jobs") if isinstance(state, dict) else None
         if not isinstance(raw_jobs, dict):
+            quarantine_file(store_file)
+            self._parameter_scan_store_error = "Backtest parameter scan state has an invalid shape; writes are disabled."
             return {}, False
+        try:
+            cold_jobs = load_records(archive_dir(store_file, "BACKTEST_PARAMETER_SCAN_ARCHIVE_DIR"), state.get("archive"))
+        except StorageCorruptionError:
+            self._parameter_scan_store_error = "Backtest parameter scan archive is damaged; writes are disabled."
+            logger.exception("Backtest parameter scan archive could not be loaded")
+            return {}, False
+        self._parameter_scan_archive_manifest = state.get("archive")
+        self._parameter_scan_cold_jobs = cold_jobs
+        raw_jobs = {**cold_jobs, **raw_jobs}
         jobs: Dict[str, Dict[str, Any]] = {}
         changed = False
         for raw_job_id, raw_job in raw_jobs.items():
-            job, job_changed = self._normalize_restored_parameter_scan_job(str(raw_job_id), raw_job)
+            job, job_changed = self._normalize_restored_parameter_scan_job(str(raw_job_id), raw_job, recover_interrupted=recover_interrupted)
             if not job:
-                changed = True
-                continue
+                quarantine_file(store_file)
+                self._parameter_scan_store_error = "Backtest parameter scan record is damaged; writes are disabled."
+                return {}, False
             jobs[str(job["jobId"])] = job
             changed = changed or job_changed
         return jobs, changed
+
+    @asynccontextmanager
+    async def _parameter_scan_transaction(self):
+        async with self._parameter_scan_jobs_lock:
+            with file_state_lock(PARAMETER_SCAN_JOB_STORE_FILE):
+                jobs, _ = self._load_parameter_scan_jobs(recover_interrupted=False)
+                if self._parameter_scan_store_error:
+                    raise StorageCorruptionError(self._parameter_scan_store_error)
+                self._parameter_scan_jobs = jobs
+                self._parameter_scan_last_saved_jobs = json.loads(json.dumps(jobs, default=str))
+                yield
 
     def _parameter_scan_job_attempt_id(self, job_id: str, attempt_number: int) -> str:
         return f"{job_id}-attempt-{attempt_number}"
@@ -1757,6 +1793,8 @@ class BacktestStore:
         self,
         fallback_job_id: str,
         raw_job: Any,
+        *,
+        recover_interrupted: bool = True,
     ) -> Tuple[Optional[Dict[str, Any]], bool]:
         if not isinstance(raw_job, dict):
             return None, True
@@ -1809,13 +1847,20 @@ class BacktestStore:
         job["leaseStatus"] = str(job.get("leaseStatus") or default_lease_status).strip().upper()
         recovery_attempt_count = _int_value(job.get("recoveryAttemptCount"), 0)
         changed = self._normalize_parameter_scan_job_attempts(job, now) or changed
-        if job["status"] in PARAMETER_SCAN_JOB_RECOVERABLE_STATUSES:
+        active_lease = (
+            job["leaseStatus"] == "LEASED"
+            and bool(job["leaseId"])
+            and _lease_is_active(job["leaseExpiresAt"], datetime.now(timezone.utc))
+        )
+        if recover_interrupted and job["status"] in PARAMETER_SCAN_JOB_RECOVERABLE_STATUSES and not active_lease:
             job["status"] = "RECOVERING"
             job["progressStep"] = "RECOVERING"
             job["recovered"] = True
             job["recoveredAt"] = now
             job["recoveryAttemptCount"] = recovery_attempt_count + 1
-            if status in {"RUNNING", "RECOVERING"}:
+            if status == "RUNNING" or (
+                status == "RECOVERING" and (job["leaseId"] or job.get("attemptCount"))
+            ):
                 changed = self._mark_interrupted_parameter_scan_job_attempt_locked(job, now) or changed
             else:
                 job["leaseStatus"] = "UNCLAIMED"
@@ -1830,24 +1875,46 @@ class BacktestStore:
         return job, changed
 
     def _save_parameter_scan_jobs_snapshot(self, jobs: Dict[str, Dict[str, Any]]) -> None:
+        if self._parameter_scan_store_error:
+            raise StorageCorruptionError(self._parameter_scan_store_error)
         store_file = PARAMETER_SCAN_JOB_STORE_FILE
+        records = {
+            str(job_id): self._public_parameter_scan_job(job, include_handoff_status=False)
+            for job_id, job in jobs.items()
+            if isinstance(job, dict)
+        }
+        hot, moved = split_hot_records(
+            records, self._parameter_scan_cold_jobs,
+            max_hot=hot_limit("BACKTEST_PARAMETER_SCAN_HOT_MAX_JOBS"),
+            keep_hot=lambda job: str(job.get("status") or "").upper() not in SIGNALOPS_RANDOM_JOB_TERMINAL_STATUSES,
+            sort_key=lambda job: (str(job.get("updatedAt") or ""), str(job.get("createdAt") or "")),
+        )
+        manifest = append_batch(
+            archive_dir(store_file, "BACKTEST_PARAMETER_SCAN_ARCHIVE_DIR"),
+            self._parameter_scan_archive_manifest, moved,
+        )
         state = {
             "schema": PARAMETER_SCAN_JOB_STORE_SCHEMA,
             "queueMode": PARAMETER_SCAN_JOB_QUEUE_MODE,
             "updatedAt": _now(),
-            "jobs": {
-                str(job_id): self._public_parameter_scan_job(job, include_handoff_status=False)
-                for job_id, job in jobs.items()
-                if isinstance(job, dict)
-            },
+            "jobs": hot,
+            "archive": manifest,
         }
         try:
             write_json_atomic(store_file, state)
         except OSError:
             logger.exception("Backtest parameter scan job store could not be saved")
+            raise
+        self._parameter_scan_archive_manifest = manifest
+        self._parameter_scan_cold_jobs.update(moved)
+        self._parameter_scan_last_saved_jobs = json.loads(json.dumps(jobs, default=str))
 
     def _persist_parameter_scan_jobs_locked(self) -> None:
-        self._save_parameter_scan_jobs_snapshot(dict(self._parameter_scan_jobs))
+        try:
+            self._save_parameter_scan_jobs_snapshot(dict(self._parameter_scan_jobs))
+        except OSError:
+            self._parameter_scan_jobs = json.loads(json.dumps(self._parameter_scan_last_saved_jobs, default=str))
+            raise
 
     def _write_json_atomic(self, path: Path, payload: Dict[str, Any]) -> None:
         write_json_atomic(path, payload)
@@ -2109,7 +2176,7 @@ class BacktestStore:
         job["lastAttemptStatus"] = normalized_status
 
     async def _start_parameter_scan_job_attempt(self, job_id: str) -> Optional[str]:
-        async with self._parameter_scan_jobs_lock:
+        async with self._parameter_scan_transaction():
             job = self._parameter_scan_jobs.get(job_id)
             if not job or str(job.get("status") or "").upper() in SIGNALOPS_RANDOM_JOB_TERMINAL_STATUSES:
                 return None
@@ -2128,13 +2195,7 @@ class BacktestStore:
             if (
                 str(job.get("leaseStatus") or "").upper() == "LEASED"
                 and _lease_is_active(job.get("leaseExpiresAt"), now_dt)
-                and current_attempt
-                and str(current_attempt.get("status") or "").upper() in PARAMETER_SCAN_JOB_ATTEMPT_ACTIVE_STATUSES
             ):
-                job["status"] = "RUNNING"
-                job["progressStep"] = "RUNNING"
-                job["updatedAt"] = now
-                self._persist_parameter_scan_jobs_locked()
                 return None
             if current_attempt and str(current_attempt.get("status") or "").upper() == "RUNNING":
                 current_attempt["status"] = "INTERRUPTED"
@@ -2204,7 +2265,7 @@ class BacktestStore:
         best_run_id: Any = None,
         updates: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        async with self._parameter_scan_jobs_lock:
+        async with self._parameter_scan_transaction():
             job = self._parameter_scan_jobs.get(job_id)
             if not job:
                 return {}
@@ -2292,7 +2353,7 @@ class BacktestStore:
             "leaseReleasedAt": None,
             "leaseSeconds": PARAMETER_SCAN_JOB_LEASE_SECONDS,
         }
-        async with self._parameter_scan_jobs_lock:
+        async with self._parameter_scan_transaction():
             self._parameter_scan_jobs[job_id] = job
             self._persist_parameter_scan_jobs_locked()
         self._schedule_parameter_scan_job(job_id)
@@ -2300,17 +2361,20 @@ class BacktestStore:
 
     async def get_parameter_scan_job(self, job_id: str) -> Optional[Dict[str, Any]]:
         should_schedule = False
-        async with self._parameter_scan_jobs_lock:
+        async with self._parameter_scan_transaction():
             job = self._parameter_scan_jobs.get(job_id)
             if job and str(job.get("status") or "").upper() in PARAMETER_SCAN_JOB_RECOVERABLE_STATUSES:
-                should_schedule = True
+                should_schedule = not (
+                    str(job.get("leaseStatus") or "").upper() == "LEASED"
+                    and _lease_is_active(job.get("leaseExpiresAt"), datetime.now(timezone.utc))
+                )
             public_job = self._public_parameter_scan_job(job) if job else None
         if should_schedule:
             self._schedule_parameter_scan_job(job_id)
         return public_job
 
     async def cancel_parameter_scan_job(self, job_id: str) -> Optional[Dict[str, Any]]:
-        async with self._parameter_scan_jobs_lock:
+        async with self._parameter_scan_transaction():
             job = self._parameter_scan_jobs.get(job_id)
             if not job:
                 return None
@@ -2331,13 +2395,13 @@ class BacktestStore:
                     best_run_id=job.get("bestRunId"),
                 )
                 task = self._parameter_scan_tasks.get(job_id)
+                self._persist_parameter_scan_jobs_locked()
                 if task and not task.done():
                     task.cancel()
-                self._persist_parameter_scan_jobs_locked()
             return self._public_parameter_scan_job(job)
 
     async def handoff_parameter_scan_job(self, job_id: str) -> Optional[Dict[str, Any]]:
-        async with self._parameter_scan_jobs_lock:
+        async with self._parameter_scan_transaction():
             job = self._parameter_scan_jobs.get(job_id)
             if not job:
                 return None
@@ -2490,7 +2554,7 @@ class BacktestStore:
         return public
 
     async def _update_parameter_scan_job(self, job_id: str, **updates: Any) -> Dict[str, Any]:
-        async with self._parameter_scan_jobs_lock:
+        async with self._parameter_scan_transaction():
             job = self._parameter_scan_jobs[job_id]
             job.update(updates)
             job["updatedAt"] = _now()
@@ -2500,14 +2564,14 @@ class BacktestStore:
     async def _run_parameter_scan_job(self, job_id: str) -> None:
         attempt_id: Optional[str] = None
         try:
-            async with self._parameter_scan_jobs_lock:
+            async with self._parameter_scan_transaction():
                 job = self._parameter_scan_jobs.get(job_id)
                 if not job or str(job.get("status") or "").upper() in SIGNALOPS_RANDOM_JOB_TERMINAL_STATUSES:
                     return
             attempt_id = await self._start_parameter_scan_job_attempt(job_id)
             if not attempt_id:
                 return
-            async with self._parameter_scan_jobs_lock:
+            async with self._parameter_scan_transaction():
                 payload = dict(self._parameter_scan_jobs[job_id].get("request") or {})
             result = await self.create_parameter_scan(
                 symbol=str(payload.get("symbol") or ""),

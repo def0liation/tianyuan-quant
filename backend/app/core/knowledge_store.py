@@ -1,8 +1,15 @@
 import json
 import uuid
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Any
+
+from .cold_archive import (
+    StorageCorruptionError, append_batch, archive_dir, hot_limit, load_records,
+    quarantine_file, split_hot_records,
+)
+from .file_utils import file_state_lock, write_json_atomic
 
 from ..models.knowledge import (
     CreateKnowledgeItemRequest,
@@ -20,6 +27,14 @@ REJECTED_STATUS = "REJECTED"
 ARCHIVED_STATUS = "ARCHIVED"
 
 
+def _serialized_knowledge_state(function):
+    @wraps(function)
+    def locked(*args, **kwargs):
+        with file_state_lock(STORAGE_FILE):
+            return function(*args, **kwargs)
+    return locked
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -34,27 +49,50 @@ def _default_state() -> dict[str, Any]:
     return {"items": [], "updated_at": _now()}
 
 
+@_serialized_knowledge_state
 def _load_state() -> dict[str, Any]:
     if not STORAGE_FILE.exists():
         state = _default_state()
         _save_state(state)
         return state
 
-    with STORAGE_FILE.open("r", encoding="utf-8") as file:
-        state = json.load(file)
-
-    if "items" not in state:
-        state["items"] = []
+    try:
+        state = json.loads(STORAGE_FILE.read_bytes())
+        if not isinstance(state, dict) or not isinstance(state.get("items"), list):
+            raise ValueError("Invalid knowledge store shape")
+    except (ValueError, UnicodeError) as exc:
+        quarantine_file(STORAGE_FILE)
+        raise StorageCorruptionError("Knowledge store is damaged; writes are disabled.") from exc
+    cold = load_records(archive_dir(STORAGE_FILE, "KNOWLEDGE_ARCHIVE_DIR"), state.get("archive"))
+    items = dict(cold)
+    for item in state["items"]:
+        if not isinstance(item, dict) or not item.get("item_id"):
+            quarantine_file(STORAGE_FILE)
+            raise StorageCorruptionError("Knowledge record is damaged; writes are disabled.")
+        items[str(item["item_id"])] = item
+    state["items"] = list(items.values())
+    state["_cold_items"] = cold
     if "updated_at" not in state:
         state["updated_at"] = _now()
     return state
 
 
+@_serialized_knowledge_state
 def _save_state(state: dict[str, Any]) -> None:
-    STORAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
     state["updated_at"] = _now()
-    with STORAGE_FILE.open("w", encoding="utf-8") as file:
-        json.dump(state, file, indent=2, ensure_ascii=False)
+    cold = state.get("_cold_items")
+    if not isinstance(cold, dict):
+        cold = load_records(archive_dir(STORAGE_FILE, "KNOWLEDGE_ARCHIVE_DIR"), state.get("archive"))
+    records = {str(item["item_id"]): item for item in state.get("items", [])}
+    hot, moved = split_hot_records(
+        records, cold, max_hot=hot_limit("KNOWLEDGE_HOT_MAX_ITEMS"),
+        keep_hot=lambda item: item.get("status") == ACTIVE_STATUS,
+        sort_key=lambda item: (str(item.get("updated_at") or ""), str(item.get("created_at") or "")),
+    )
+    manifest = append_batch(archive_dir(STORAGE_FILE, "KNOWLEDGE_ARCHIVE_DIR"), state.get("archive"), moved)
+    persisted = {key: value for key, value in state.items() if not key.startswith("_")}
+    persisted.update(items=list(hot.values()), archive=manifest)
+    write_json_atomic(STORAGE_FILE, persisted)
 
 
 def _items_from_state(state: dict[str, Any]) -> list[KnowledgeItem]:
@@ -121,6 +159,7 @@ def get_active_knowledge_context(limit: int = 8) -> list[dict[str, Any]]:
     ]
 
 
+@_serialized_knowledge_state
 def create_knowledge_item(
     request: CreateKnowledgeItemRequest,
     *,
@@ -164,6 +203,7 @@ def create_knowledge_item(
     return item
 
 
+@_serialized_knowledge_state
 def review_knowledge_item(item_id: str, request: ReviewKnowledgeItemRequest) -> KnowledgeItem:
     state = _load_state()
     items = _items_from_state(state)
@@ -199,11 +239,12 @@ def review_knowledge_item(item_id: str, request: ReviewKnowledgeItemRequest) -> 
     item.is_real_trade = False
     item.strong_conclusion_allowed = False
 
-    state["items"] = [_dump(item if entry.item_id == item_id else entry) for entry in items]
+    state["items"] = [_dump(item) if entry.get("item_id") == item_id else entry for entry in state["items"]]
     _save_state(state)
     return item
 
 
+@_serialized_knowledge_state
 def create_learning_candidate_from_run(
     run_data: dict[str, Any],
     *,
@@ -226,8 +267,7 @@ def create_learning_candidate_from_run(
             return existing
 
     item = _candidate_from_run(run_data)
-    items.append(item)
-    state["items"] = [_dump(entry) for entry in items]
+    state["items"].append(_dump(item))
     _save_state(state)
     return item
 

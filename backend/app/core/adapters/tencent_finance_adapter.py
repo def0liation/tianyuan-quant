@@ -130,7 +130,8 @@ def _fetch_tencent_public_quote_sync(symbol: str, timeout_seconds: int) -> Marke
             base_url=TENCENT_PUBLIC_QUOTE_BASE_URL,
             quote_path=url,
             api_key="",
-        )
+        ),
+        endpoint=url,
     )
     request = Request(
         url,

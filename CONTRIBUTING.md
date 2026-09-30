@@ -18,9 +18,9 @@ Contributions to Tianyuan Quant are welcome. Start with the [README](README.md) 
 
 ## 环境与首装 / Environment and first setup
 
-后端使用 Python 3.11+；前端锁文件中的 Vite 5 要求 Node.js `^18.0.0 || >=20.0.0`。Docker 文件使用 Python 3.11 和 Node.js 20。前端采用 npm，并提交了 `frontend/package-lock.json`；后端依赖以 `backend/requirements.txt` 为准，部分依赖是范围版本，尚无完整 Python 锁文件。
+后端使用 Python 3.13；前端锁文件中的 Vite 5 要求 Node.js `^18.0.0 || >=20.0.0`。Docker 文件使用 Python 3.13 和 Node.js 20。前端采用 npm 锁文件；后端在 `backend/requirements.txt` 声明依赖，`backend/requirements.lock` 固定解析版本和 SHA-256，安装使用 `--require-hashes`。
 
-The backend uses Python 3.11+. Vite 5 in the frontend lockfile requires Node.js `^18.0.0 || >=20.0.0`; the Docker files use Python 3.11 and Node.js 20. The frontend uses npm with `frontend/package-lock.json`. Backend dependencies are declared in `backend/requirements.txt`; some use version ranges, and there is no complete Python lockfile.
+The backend uses Python 3.13. Vite 5 in the frontend lockfile requires Node.js `^18.0.0 || >=20.0.0`; the Docker files use Python 3.13 and Node.js 20. The frontend uses npm lockfiles. Backend dependencies are declared in `backend/requirements.txt`; `backend/requirements.lock` pins resolved versions and SHA-256 hashes. Install with `--require-hashes`.
 
 ### Windows / PowerShell
 
@@ -51,7 +51,7 @@ Use the existing Python and frontend entry points in two terminals. These comman
 ```bash
 # Terminal 1, from the repository root / 终端 1，仓库根目录
 python3 -m venv backend/.venv
-backend/.venv/bin/python -m pip install -r backend/requirements.txt
+backend/.venv/bin/python -m pip install --require-hashes -r backend/requirements.lock
 TIANYUAN_FORCE_MOCK_MARKET_DATA=1 backend/.venv/bin/python backend/start_uvicorn.py --no-reload
 ```
 

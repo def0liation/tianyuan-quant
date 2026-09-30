@@ -1,0 +1,94 @@
+name: Source and deployment checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-source:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      PYTHONPATH: backend
+      PYTHONDONTWRITEBYTECODE: '1'
+      SEED_MOCK_HISTORY: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: backend/requirements.lock
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+      - name: Install locked dependencies
+        run: |
+          python -m pip install --require-hashes -r backend/requirements.lock
+          python -m pip check
+          npm ci
+          npm --prefix frontend ci
+          npm --prefix frontend exec -- playwright install chromium
+      - name: Backend regression suite
+        run: |
+          New-Item -ItemType Directory -Path .tmp -Force | Out-Null
+          python -m pytest backend/tests -q --basetemp=.tmp/ci-pytest
+      - name: Frontend checks and browser session regression
+        run: |
+          npm run typecheck
+          npm run lint
+          npm run build
+          npm run smoke:frontend
+          npm run test:preview-security
+          npm run test:session-persistence
+
+  container-startup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      API_WRITE_TOKEN: ci-synthetic-admin-token
+      AGENT_RUNTIME_SECRET_KEY: ci-synthetic-vault-key-for-isolated-check
+      CORS_ORIGINS: http://127.0.0.1:5174
+      TIANYUAN_FORCE_MOCK_MARKET_DATA: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Compose configuration
+        run: |
+          docker compose config --quiet
+          docker compose -f docker-compose.prod.yml config --quiet
+      - name: Build and start production examples
+        run: docker compose -f docker-compose.prod.yml up --build --wait --wait-timeout 180
+      - name: Verify readiness and auth boundary
+        run: |
+          curl --fail --silent http://127.0.0.1:8000/api/ready
+          curl --fail --silent http://127.0.0.1:5174/ > /dev/null
+          code=$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:8000/api/config/schema)
+          test "$code" = 401
+      - name: Verify proxy and backend access logs omit query credentials
+        run: |
+          docker compose -f docker-compose.prod.yml exec -T frontend nginx -t
+          mkdir -p .tmp
+          code=$(curl --silent --show-error --max-time 15 --output .tmp/ci-stream.body --dump-header .tmp/ci-stream.headers --write-out '%{http_code}' "http://127.0.0.1:5174/api/analysis/runs/RUN_CI_MISSING/stream?api_key=$API_WRITE_TOKEN")
+          test "$code" = 200
+          grep --ignore-case --quiet '^content-type: text/event-stream' .tmp/ci-stream.headers
+          grep --fixed-strings --quiet 'RUN_NOT_FOUND' .tmp/ci-stream.body
+          ci_service_logs=$(docker compose -f docker-compose.prod.yml logs --no-color)
+          if printf '%s' "$ci_service_logs" | grep --fixed-strings --quiet -- "$API_WRITE_TOKEN"; then
+            printf '%s\n' 'Access log credential redaction failed'
+            exit 1
+          fi
+      - name: Container diagnostics on failure
+        if: failure()
+        run: |
+          curl --silent --show-error http://127.0.0.1:8000/api/ready || true
+          docker compose -f docker-compose.prod.yml logs --no-color --tail 100
+      - name: Stop isolated services
+        if: always()
+        run: docker compose -f docker-compose.prod.yml down --volumes

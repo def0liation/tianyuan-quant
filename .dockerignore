@@ -1,6 +1,7 @@
 .git
 .gitignore
 .agents/
+.workbuddy/
 .claude/
 .codex/
 .superpowers/
@@ -37,6 +38,7 @@ dist/
 storage/
 deploy/db/
 deploy/backend-storage/
+deploy/backups/
 backend/storage/
 backend/app/storage/
 

@@ -1,6 +1,7 @@
 import asyncio
 import os
 import time
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
@@ -8,6 +9,7 @@ from typing import Any, Dict, List
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 
 from ..core import analysis_job_store
 from ..core.auto_paper_trading import auto_paper_trading_store
@@ -44,12 +46,15 @@ async def get_readiness():
         "autoPaperTrading": _check_auto_paper(),
     }
     degraded = [name for name, check in checks.items() if check.get("status") != "ok"]
+    startup = await startup_status.snapshot()
+    if not startup["coreReady"]:
+        degraded.append("startup")
     payload = {
         "status": "ready" if not degraded else "degraded",
         "generatedAt": datetime.now().isoformat(),
         "degradedChecks": degraded,
         "checks": checks,
-        "startup": await startup_status.snapshot(),
+        "startup": startup,
     }
     return JSONResponse(status_code=200 if not degraded else 503, content=payload)
 
@@ -194,20 +199,29 @@ async def _check_database() -> Dict[str, Any]:
         }
 
 
+def _effective_database_path() -> Path | None:
+    url = make_url(DATABASE_URL)
+    if url.get_backend_name() != "sqlite" or not url.database or url.database == ":memory:":
+        return None
+    return Path(url.database).resolve()
+
+
 def _check_storage() -> Dict[str, Any]:
+    database_path = _effective_database_path()
     paths = {
-        "database": DB_PATH.parent,
         "appStorage": Path(__file__).resolve().parents[1] / "storage",
         "jobStore": analysis_job_store.STORAGE_FILE.parent,
     }
+    if database_path is not None:
+        paths["database"] = database_path.parent
     failed = []
     details = {}
     for name, path in paths.items():
         try:
             path.mkdir(parents=True, exist_ok=True)
-            probe = path / ".ready_probe"
-            probe.write_text("ok", encoding="utf-8")
-            probe.unlink(missing_ok=True)
+            with tempfile.NamedTemporaryFile(prefix=".ready_probe_", dir=path) as probe:
+                probe.write(b"ok")
+                probe.flush()
             details[name] = {"writable": True}
         except Exception as exc:
             failed.append(name)
@@ -227,9 +241,13 @@ def _check_auto_paper() -> Dict[str, Any]:
     try:
         status = auto_paper_trading_store.get_status()
         loop_health = str(status.get("loop_health") or "UNKNOWN")
+        enabled = bool(status.get("enabled"))
+        healthy = loop_health in {"DISABLED", "HEALTHY", "STARTING", "RUNNING"} or (
+            not enabled and loop_health == "STOPPED"
+        )
         return {
-            "status": "ok" if loop_health in {"DISABLED", "HEALTHY", "STARTING"} else "warn",
-            "enabled": bool(status.get("enabled")),
+            "status": "ok" if healthy else "warn",
+            "enabled": enabled,
             "loopRunning": bool(status.get("loop_running")),
             "loopHealth": loop_health,
             "lastError": status.get("last_error") or status.get("loop_last_error") or "",
@@ -274,7 +292,8 @@ def _auto_paper_metrics() -> Dict[str, Any]:
 
 def _storage_metrics() -> Dict[str, Any]:
     app_storage = Path(__file__).resolve().parents[1] / "storage"
-    database_bytes = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+    database_path = _effective_database_path()
+    database_bytes = database_path.stat().st_size if database_path is not None and database_path.exists() else 0
     app_storage_files = 0
     if app_storage.exists():
         try:
@@ -282,7 +301,7 @@ def _storage_metrics() -> Dict[str, Any]:
         except OSError:
             app_storage_files = 0
     return {
-        "databasePath": str(DB_PATH),
+        "databasePath": str(database_path) if database_path is not None else "",
         "databaseBytes": database_bytes,
         "appStoragePath": str(app_storage),
         "appStorageFiles": app_storage_files,

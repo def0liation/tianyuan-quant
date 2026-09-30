@@ -10,7 +10,7 @@
 
 | Layer | Technology |
 |-------|-----------|
-| Backend | Python 3.11+, FastAPI 0.104, SQLAlchemy 2.0 (async), SQLite via aiosqlite |
+| Backend | Python 3.13, FastAPI 0.104, SQLAlchemy 2.0 (async), SQLite via aiosqlite |
 | Frontend | React 18, TypeScript 5.x, Vite 5.x, Tailwind CSS 3.x, Zustand 4.x, React Router 6.x |
 | Charts | Recharts 2.x, ReactFlow 11.x |
 | Dev tools | Alembic (migrations), Pytest (backend tests), ESLint (frontend lint), Playwright (E2E smoke) |

@@ -3,8 +3,11 @@ import secrets
 from typing import Iterable
 
 from fastapi import Request
+from pydantic import TypeAdapter, ValidationError
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
+
+from .access_log import install_access_log_redaction
 
 from .operator_context import (
     OperatorContext,
@@ -35,6 +38,7 @@ FULL_API_AUTH_MODES = {"on", "enabled", "required", "strict"}
 WRITE_ONLY_AUTH_MODES = {"write", "write_protect"}
 DISABLED_AUTH_MODES = {"off", "disabled", "none", "dev", "development", "local", "bypass"}
 PRODUCTION_ENVIRONMENTS = {"prod", "production", "staging", "strict"}
+_BOOL_QUERY_ADAPTER = TypeAdapter(bool)
 
 
 def _env(name: str) -> str:
@@ -95,6 +99,25 @@ def configured_api_tokens() -> list[str]:
 def protected_write_request(request: Request) -> bool:
     path = request.url.path
     return (path == "/api" or path.startswith("/api/")) and request.method.upper() in WRITE_METHODS
+
+
+def active_check_request(request: Request) -> bool:
+    path = request.url.path.rstrip("/")
+    if request.method.upper() != "GET":
+        return False
+    if path == "/api/agents/market-data/status":
+        return True
+    if path != "/api/agents/market-data/adapters":
+        return False
+    # Match the bool scalar consumed by FastAPI, including repeated query keys.
+    try:
+        return _BOOL_QUERY_ADAPTER.validate_python(request.query_params.get("live_check", "")) is True
+    except ValidationError:
+        return False  # The route returns 422 for invalid booleans without a check.
+
+
+def protected_control_request(request: Request) -> bool:
+    return protected_write_request(request) or active_check_request(request)
 
 
 def public_api_request_path(path: str, method: str) -> bool:
@@ -179,6 +202,18 @@ def required_operator_role(request: Request) -> tuple[str, str]:
     path = raw_path.rstrip("/") or raw_path
     method = request.method.upper()
 
+    if active_check_request(request):
+        return "operator", "market_data_active_check"
+    if method == "PUT" and (
+        path == "/api/agents/data-sources"
+        or (path.startswith("/api/agents/market-data/adapters/") and path.endswith("/config"))
+    ):
+        return "admin", "market_data_config"
+    if method == "POST" and (
+        (path.startswith("/api/agents/data-sources/") and path.endswith("/test"))
+        or (path.startswith("/api/agents/market-data/adapters/") and path.endswith("/health"))
+    ):
+        return "operator", "market_data_active_check"
     if method == "DELETE":
         return "admin", "delete"
     if method == "PATCH" and path == "/api/config/runtime":
@@ -249,12 +284,12 @@ def _operator_for_response(operator: OperatorContext) -> dict[str, str]:
     }
 
 
-def operator_role_response(operator: OperatorContext, required_role: str, policy_scope: str) -> JSONResponse:
+def operator_role_response(operator: OperatorContext, required_role: str, policy_scope: str, *, active_read: bool = False) -> JSONResponse:
     return JSONResponse(
         status_code=403,
         content={
             "detail": {
-                "message": "Operator role is not allowed for this write.",
+                "message": "Operator role is not allowed for this operation." if active_read else "Operator role is not allowed for this write.",
                 "required_role": required_role,
                 "scope": policy_scope,
                 "operator": _operator_for_response(operator),
@@ -266,6 +301,7 @@ def operator_role_response(operator: OperatorContext, required_role: str, policy
 class APIWriteAuthMiddleware:
     def __init__(self, app: ASGIApp):
         self.app = app
+        install_access_log_redaction()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -275,7 +311,7 @@ class APIWriteAuthMiddleware:
         request = Request(scope, receive=receive)
         operator = resolve_operator_from_request(request)
         auth_required = protected_api_request(request) and (
-            full_api_auth_enabled() or (protected_write_request(request) and write_auth_enabled())
+            full_api_auth_enabled() or (protected_control_request(request) and write_auth_enabled())
         )
         if auth_required:
             expected_tokens = configured_api_tokens()
@@ -322,10 +358,10 @@ class APIWriteAuthMiddleware:
         scope.setdefault("state", {})["operator"] = operator
         operator_token = set_current_operator(operator)
         try:
-            if protected_write_request(request):
+            if protected_control_request(request):
                 required_role, policy_scope = required_operator_role(request)
                 if not role_allows(operator.role, required_role):
-                    response = operator_role_response(operator, required_role, policy_scope)
+                    response = operator_role_response(operator, required_role, policy_scope, active_read=active_check_request(request))
                     await response(scope, receive, send)
                     return
 

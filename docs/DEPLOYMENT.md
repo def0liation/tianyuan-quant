@@ -1,5 +1,7 @@
 # Deployment Guide
 
+The 2026-09-29 changes and complete-history archive/backup commands are documented in [Audit remediation and operations](AUDIT_REMEDIATION_2026-09-29.md). The new container CI has not yet run on GitHub. Treat Compose syntax validation and isolated Windows tests separately from actual container acceptance.
+
 This project is deployed as two services:
 
 - `backend`: FastAPI on port `8000`

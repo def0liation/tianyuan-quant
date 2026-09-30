@@ -5,8 +5,14 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$projectRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
+$projectRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 $backendPath = Join-Path $projectRoot "backend"
+
+function Resolve-ProjectPath([string]$PathValue, [switch]$MustExist) {
+  $candidate = if ([System.IO.Path]::IsPathRooted($PathValue)) { $PathValue } else { Join-Path $projectRoot $PathValue }
+  if ($MustExist) { return (Resolve-Path -LiteralPath $candidate).Path }
+  return [System.IO.Path]::GetFullPath($candidate)
+}
 
 function Get-ProjectPython {
   $candidates = @()
@@ -36,10 +42,13 @@ function Get-ProjectPython {
 
 Push-Location $backendPath
 try {
-  $sourcePath = Resolve-Path (Join-Path $projectRoot $SourceDb)
-  $backupPath = Join-Path $projectRoot $BackupDir
+  $sourcePath = Resolve-ProjectPath $SourceDb -MustExist
+  $backupPath = Resolve-ProjectPath $BackupDir
   $python = Get-ProjectPython
-  & $python -m app.db.backup backup --source-db $sourcePath --backup-dir $backupPath --label $Label
+  $pythonArgs = @("-m", "app.db.backup", "backup", "--source-db", $sourcePath, "--backup-dir", $backupPath)
+  if (-not [string]::IsNullOrWhiteSpace($Label)) { $pythonArgs += @("--label", $Label) }
+  & $python @pythonArgs
+  if ($LASTEXITCODE -ne 0) { throw "SQLite backup helper failed with exit code $LASTEXITCODE." }
 }
 finally {
   Pop-Location

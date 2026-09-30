@@ -316,6 +316,8 @@ async def test_ops_log_time_based_retention_prunes_old_events(monkeypatch, tmp_p
     log_file = tmp_path / "ops_events_retention.jsonl"
     monkeypatch.setenv("OPS_LOG_FILE", str(log_file))
     monkeypatch.setenv("OPS_LOG_RETENTION_DAYS", "1")
+    handoff_dir = tmp_path / "handoff"
+    monkeypatch.setenv("OPS_LOG_EXPORT_HANDOFF_DIR", str(handoff_dir))
     routes_health.ops_event_log.clear()
 
     old_event = {
@@ -342,6 +344,8 @@ async def test_ops_log_time_based_retention_prunes_old_events(monkeypatch, tmp_p
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
         status_response = await client.get("/api/ops/logs/status?limit=20")
         export_response = await client.get("/api/ops/logs/export?limit=20")
+        filtered_response = await client.get("/api/ops/logs/export", params={"since": fresh_event["created_at"], "level": "warning"})
+        handoff_response = await client.post("/api/ops/logs/export/handoff?limit=20&level=info")
 
     assert status_response.status_code == 200
     status = status_response.json()
@@ -355,8 +359,21 @@ async def test_ops_log_time_based_retention_prunes_old_events(monkeypatch, tmp_p
     assert export_response.status_code == 200
     exported = export_response.json()
     assert exported["retention_policy"]["max_age_days"] == 1
-    assert all(item["id"] != "old-retention-event" for item in exported["events"])
+    assert any(item["id"] == "old-retention-event" for item in exported["events"])
     assert any(item["id"] == "fresh-retention-event" for item in exported["events"])
+
+    assert filtered_response.status_code == 200
+    assert [item["id"] for item in filtered_response.json()["events"]] == ["fresh-retention-event"]
+    assert handoff_response.status_code == 200
+    handoff = handoff_response.json()
+    assert handoff["status"] == "HANDED_OFF"
+    bundle = json.loads((handoff_dir / handoff["bundle_file"]).read_text(encoding="utf-8"))
+    manifest = json.loads((handoff_dir / handoff["manifest_file"]).read_text(encoding="utf-8"))
+    assert "old-retention-event" in [item["id"] for item in bundle["events"]]
+    assert "fresh-retention-event" not in [item["id"] for item in bundle["events"]]
+    assert manifest["event_count"] == handoff["event_count"] == bundle["event_count"]
+    assert manifest["exported_count"] == handoff["exported_count"] == len(bundle["events"])
+    assert manifest["bundle_checksum"] == handoff["bundle_checksum"] == bundle["checksum"]
 
     persisted = log_file.read_text(encoding="utf-8")
     assert "old-retention-event" not in persisted
@@ -365,6 +382,8 @@ async def test_ops_log_time_based_retention_prunes_old_events(monkeypatch, tmp_p
 
 @pytest.mark.asyncio
 async def test_ready_reports_degraded_when_dependency_check_fails(monkeypatch):
+    await startup_status.reset()
+    await startup_status.mark_core_ready()
     async def fake_database_check():
         return {"status": "error", "message": "db unavailable"}
 

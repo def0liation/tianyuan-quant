@@ -6,6 +6,12 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$OriginalTestEnv = @{}
+foreach ($Name in @("TEMP", "TMP", "PYTHONPATH", "UV_CACHE_DIR")) {
+    $OriginalTestEnv[$Name] = [Environment]::GetEnvironmentVariable($Name, "Process")
+}
+$TestSucceeded = $false
+$OwnBaseTemp = $false
 
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $UvCacheDirOverride = [string]$env:TIANYUAN_UV_CACHE_DIR
@@ -30,7 +36,7 @@ else {
 $PytestTempDir = Join-Path $SystemTempRoot ("pytest-temp-{0}" -f $TempRunId)
 $PytestBaseTempDir = Join-Path $Root (".tmp\pytest-basetemp-{0}" -f $TempRunId)
 $BackendDir = Join-Path $Root "backend"
-$Requirements = Join-Path $BackendDir "requirements.txt"
+$Requirements = Join-Path $BackendDir "requirements.lock"
 $BundledPython = Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
 $RepoVenvPython = Join-Path $Root ".venv\Scripts\python.exe"
 
@@ -61,6 +67,22 @@ function Resolve-BackendPythonOverride([string]$PathValue) {
         throw "TIANYUAN_BACKEND_TEST_PYTHON points to a missing Python executable: $Candidate"
     }
     return (Resolve-Path -LiteralPath $Candidate).Path
+}
+
+function Remove-GeneratedTestDirectory([string]$TargetPath, [string]$AllowedRoot, [string]$ExpectedName) {
+    if (-not (Test-Path -LiteralPath $TargetPath)) { return }
+    $FullRoot = [System.IO.Path]::GetFullPath($AllowedRoot).TrimEnd('\')
+    $FullTarget = (Resolve-Path -LiteralPath $TargetPath).Path.TrimEnd('\')
+    $ExpectedTarget = [System.IO.Path]::GetFullPath((Join-Path $FullRoot $ExpectedName)).TrimEnd('\')
+    if (-not $FullTarget.Equals($ExpectedTarget, [System.StringComparison]::OrdinalIgnoreCase) -or
+        -not $FullTarget.StartsWith($FullRoot + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing cleanup outside this run's generated test directory."
+    }
+    $Item = Get-Item -LiteralPath $FullTarget -Force
+    if (($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Refusing cleanup through a reparse point."
+    }
+    Remove-Item -LiteralPath $FullTarget -Recurse -Force
 }
 
 $UseDirectPython = $false
@@ -153,6 +175,7 @@ try {
     }
     if (-not $HasBaseTemp) {
         $PytestCommandArgs += "--basetemp=$PytestBaseTempDir"
+        $OwnBaseTemp = $true
     }
     $PytestCommandArgs += $PytestArgs
     if ($UseDirectPython) {
@@ -177,7 +200,17 @@ try {
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
+    $TestSucceeded = $true
 }
 finally {
     Pop-Location
+    foreach ($Name in $OriginalTestEnv.Keys) {
+        [Environment]::SetEnvironmentVariable($Name, $OriginalTestEnv[$Name], "Process")
+    }
+    if ($TestSucceeded) {
+        if ($OwnBaseTemp) {
+            Remove-GeneratedTestDirectory $PytestBaseTempDir (Join-Path $Root ".tmp") ("pytest-basetemp-{0}" -f $TempRunId)
+        }
+        Remove-GeneratedTestDirectory $PytestTempDir $SystemTempRoot ("pytest-temp-{0}" -f $TempRunId)
+    }
 }
