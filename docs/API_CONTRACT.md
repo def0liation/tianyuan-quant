@@ -1043,11 +1043,15 @@ Returns a bounded export bundle for the local structured ops event log. Query pa
 
 Response fields include `schema="ops_log_export_v1"`, `channel="local_file_jsonl_export"`, `source_channel="local_file_jsonl"`, `external_delivery_enabled=false`, `external_aggregation_ready=true`, `log_file`, `event_count`, `exported_count`, `level_filter`, `since`, `checksum`, `retention_policy`, `redaction_policy`, and `events[]`.
 
+Exports read cold archive batches, durable pending cold records, and the hot JSONL window. `event_count` counts this combined history. The `level` and inclusive `since` filters apply before taking the last `limit` matching records in persisted history order. The bundle cap is 1000 events, independent of `OPS_LOG_MAX_EVENTS`; it is a bounded window, not a paginated or unlimited export. Historical reads currently load the combined history into memory. A missing or corrupt referenced archive fails the export rather than returning a partial hot-only bundle.
+
 `checksum` is a SHA-256 digest over the exported `events[]` payload. Exported events are the same sanitized records used by `/ops/logs/status`: request path excludes query strings, and events must not include request headers, authorization values, request bodies, or raw query strings. This endpoint is intended for local sidecar ingestion into deployment-managed centralized logging; it does not push logs to an external provider by itself.
 
 ### POST /ops/logs/export/handoff
 
 Writes a bounded sanitized ops-log export bundle and companion manifest into the deployment-configured handoff directory. Query parameters match `GET /ops/logs/export`: `limit`, `level`, and `since`.
+
+The handoff uses the same archive-inclusive export, filters, and 1000-event cap. Its manifest counts and checksum describe the saved bundle. Archive read failures occur before handoff files are created.
 
 Set `OPS_LOG_EXPORT_HANDOFF_DIR` to enable the local file handoff. When the variable is not configured, the endpoint returns `schema="ops_log_export_handoff_v1"`, `status="DISABLED"`, `handoff_destination="NOT_CONFIGURED"`, and does not write bundle or manifest files.
 

@@ -26,7 +26,7 @@ The requested scope is to fix verified problems and assess the public GitHub upd
 
 | 环境 / Setting | 默认 / Default | 规则 / Rule |
 | --- | --- | --- |
-| OPS_LOG_MAX_EVENTS | 1000，最小 100 | 热日志超限或超龄归档，完整 query 包含冷历史；status/export 仍是热窗口。 |
+| OPS_LOG_MAX_EVENTS | 1000，最小 100 | 热日志超限或超龄归档；status 仍是热窗口，query/export/handoff 包含冷历史。单次 export/handoff 按 level/since 筛选后最多导出 1000 条，不受热水位限制。 |
 | OPS_LOG_RETENTION_DAYS | 30 | 控制热窗口年龄，不删除冷历史。 |
 | KNOWLEDGE_HOT_MAX_ITEMS | 1000 | ACTIVE 知识保持热存储，上限因此为软上限；冷候选仍可审核。 |
 | BACKTEST_PARAMETER_SCAN_HOT_MAX_JOBS | 1000 | 非终态扫描保持热存储，上限为软上限；完整历史可查询。 |

@@ -521,7 +521,7 @@ class OpsEventLog:
         }
 
     def export_bundle(self, *, limit: int = 100, level: str = "", since: str = "") -> dict[str, Any]:
-        events = self._read_events()
+        events = self._read_history_events()
         normalized_level = _filter_level(level) if level else ""
         since_dt = _parse_timestamp(since)
         filtered = []
@@ -533,7 +533,7 @@ class OpsEventLog:
                 if event_time is None or event_time < since_dt:
                     continue
             filtered.append(event)
-        export_limit = max(1, min(int(limit or 100), self._max_events, 1000))
+        export_limit = max(1, min(int(limit or 100), 1000))
         exported = filtered[-export_limit:]
         return {
             "generated_at": _now_iso(),
